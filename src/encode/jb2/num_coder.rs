@@ -1,86 +1,145 @@
-// src/jb2/num_coder.rs
+//! Adaptive integer coder compatible with a fixed-context arithmetic coder.
 
-use crate::encode::zp::zp_codec::{BitContext, ZpEncoder};
+use crate::arithmetic_coder::Jb2ArithmeticEncoder;
 use crate::encode::jb2::error::Jb2Error;
 use std::io::Write;
 
-/// Maximum number of contexts before a reset is needed (for fuzz safety).
-const CELLCHUNK: usize = 20_000;
-/// Bounds for signed integer coding (to catch invalid inputs).
+/// Bounds for signed integer coding.
 pub const BIG_POSITIVE: i32 = 262_142;
 pub const BIG_NEGATIVE: i32 = -262_143;
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct NumCodeNode {
-    bit_ctx: BitContext,
+    // This node's context index within the main Jb2ArithmeticEncoder.
+    context_index: u32,
+    // Indices into the `nodes` vector for children.
     left_child: u32,
     right_child: u32,
 }
 
-/// Adaptive integer coder with dynamic context allocation.
+/// Adaptive integer coder that uses a pre-allocated slice of contexts
+/// from a `Jb2ArithmeticEncoder`.
 pub struct NumCoder {
     nodes: Vec<NumCodeNode>,
+    next_context: u32,
+    max_contexts: u32,
 }
 
 impl NumCoder {
-    /// Create a fresh NumCoder with a dummy root context.
-    pub fn new() -> Self {
-        let mut nodes = Vec::with_capacity(CELLCHUNK + 1);
-        nodes.push(NumCodeNode::default()); // index 0 is the "null" context
-        Self { nodes }
+    /// Creates a new NumCoder that will use a specific range of contexts.
+    pub fn new(base_context_index: u32, max_contexts: u32) -> Self {
+        let mut nodes = Vec::with_capacity(256);
+        // Node 0 is the root for any new coding tree.
+        nodes.push(NumCodeNode {
+            context_index: base_context_index,
+            left_child: 0,
+            right_child: 0,
+        });
+        Self {
+            nodes,
+            next_context: base_context_index + 1,
+            max_contexts,
+        }
     }
 
-    /// Clear all contexts, returning to initial state.
-    pub fn reset(&mut self) {
-        self.nodes.clear();
-        self.nodes.push(NumCodeNode::default());
+    /// Allocates a new context and returns its handle
+    pub fn alloc_context(&mut self) -> u32 {
+        if self.next_context >= self.max_contexts {
+            // Reuse contexts if we run out (simple round-robin)
+            self.next_context = 0;
+        }
+        let ctx = self.next_context;
+        self.next_context += 1;
+        ctx
     }
 
-    /// Encode an integer `value` in the range [low, high].
-    /// `ctx_handle` holds the entry context index, and is updated to the final context for reuse.
+    /// Encodes a signed integer using adaptive binary coding
+    pub fn code_int<W: Write>(
+        &mut self,
+        ac: &mut Jb2ArithmeticEncoder<W>,
+        value: i32,
+        ctx_handle: &mut u32,
+    ) -> Result<(), Jb2Error> {
+        // Encode the sign bit
+        let sign_bit = value < 0;
+        let uvalue = value.unsigned_abs() as u32;
+        
+        // Encode the magnitude using adaptive binary coding
+        let mut mask = 1u32 << 30; // Start with a high bit
+        while mask > 0 && (uvalue & mask) == 0 {
+            mask >>= 1;
+        }
+        
+        // Allocate context if needed
+        if *ctx_handle == 0 {
+            *ctx_handle = self.alloc_context();
+        }
+        
+        // Encode the bits
+        while mask > 0 {
+            let bit = (uvalue & mask) != 0;
+            ac.encode_bit(*ctx_handle as usize, bit)?;
+            mask >>= 1;
+        }
+        
+        // Encode the sign bit if non-zero
+        if uvalue != 0 {
+            ac.encode_bit(*ctx_handle as usize, sign_bit)?;
+        }
+        
+        Ok(())
+    }
+
+    /// Encodes an integer `value` in the range [low, high].
+    /// `ctx_handle` tracks the root of the probability tree for this value type.
     pub fn code_num<W: Write>(
         &mut self,
-        zp: &mut ZpEncoder<W>,
+        ac: &mut Jb2ArithmeticEncoder<W>,
         mut value: i32,
         mut low: i32,
         mut high: i32,
         ctx_handle: &mut u32,
     ) -> Result<(), Jb2Error> {
-        // Range check
         if value < low || value > high {
-            return Err(Jb2Error::InvalidNumber(
-                format!("Value {} outside of [{}, {}]", value, low, high)
-            ));
+            return Err(Jb2Error::InvalidNumber(format!(
+                "Value {} outside of [{}, {}]", value, low, high
+            )));
         }
 
-        let mut ctx_idx = *ctx_handle as usize;
+        let mut node_idx = *ctx_handle as usize;
 
-        // === Phase 1: Sign bit ===
-        let negative = value < 0;
+        // Phase 1: Sign bit
         if low < 0 && high >= 0 {
-            self.alloc_ctx(ctx_idx)?;
-            let node = &mut self.nodes[ctx_idx];
-            zp.encode(negative, &mut node.bit_ctx)?;
-            ctx_idx = if negative { node.left_child as usize } else { node.right_child as usize };
-        }
-        if negative {
-            // Mirror range for magnitude coding
-            value = -value - 1;
-            let temp = -low - 1;
-            low = -high - 1;
-            high = temp;
+            self.alloc_children(node_idx)?;
+            let node = &self.nodes[node_idx];
+            let negative = value < 0;
+            ac.encode_bit(node.context_index as usize, negative)?;
+            node_idx = if negative {
+                node.left_child as usize
+            } else {
+                node.right_child as usize
+            };
+            if negative {
+                let temp = -low - 1;
+                low = -high - 1;
+                high = temp;
+                value = -value - 1;
+            }
         }
 
-        // === Phases 2 & 3: Magnitude bits ===
+        // Phase 2 & 3: Magnitude bits
         let mut cutoff = 1;
         while low < high {
-            self.alloc_ctx(ctx_idx)?;
-            let node = &mut self.nodes[ctx_idx];
+            self.alloc_children(node_idx)?;
+            let node = &self.nodes[node_idx];
             let bit = value >= cutoff;
-            zp.encode(bit, &mut node.bit_ctx)?;
-            ctx_idx = if bit { node.right_child as usize } else { node.left_child as usize };
+            ac.encode_bit(node.context_index as usize, bit)?;
+            node_idx = if bit {
+                node.right_child as usize
+            } else {
+                node.left_child as usize
+            };
 
-            // Narrow range
             if !bit {
                 high = cutoff - 1;
             } else {
@@ -89,44 +148,31 @@ impl NumCoder {
             cutoff = (low + high + 1) / 2;
         }
 
-        *ctx_handle = ctx_idx as u32;
+        *ctx_handle = node_idx as u32;
         Ok(())
     }
 
-    /// Check if a reset is needed due to context overflow
-    pub fn needs_reset(&self) -> bool {
-        self.nodes.len() >= CELLCHUNK
-    }
+    /// Ensures the children for a given node are allocated.
+    fn alloc_children(&mut self, node_idx: usize) -> Result<(), Jb2Error> {
+        if self.nodes[node_idx].left_child == 0 {
+            let left_idx = self.nodes.len() as u32;
+            let right_idx = left_idx + 1;
+            self.nodes[node_idx].left_child = left_idx;
+            self.nodes[node_idx].right_child = right_idx;
 
-    /// Ensure the context at `index` and its children exist.
-    fn alloc_ctx(&mut self, index: usize) -> Result<(), Jb2Error> {
-        // Check for potential overflow before allocation
-        if self.nodes.len() + 3 > CELLCHUNK {
-            return Err(Jb2Error::ContextOverflow);
-        }
-        
-        // Allocate this node if missing
-        if index >= self.nodes.len() {
-            // Must grow sequentially: only allow next index
-            if index != self.nodes.len() {
-                return Err(Jb2Error::BadNumber(
-                    format!("Non-sequential context allocation: {} vs {}", index, self.nodes.len())
-                ));
+            if self.next_context + 1 > self.max_contexts {
+                return Err(Jb2Error::ContextOverflow);
             }
-            self.nodes.push(NumCodeNode::default());
-        }
-        let node = &mut self.nodes[index];
-        // Allocate left child if first visit
-        if node.left_child == 0 {
-            let child_idx = self.nodes.len() as u32;
-            node.left_child = child_idx;
-            self.nodes.push(NumCodeNode::default());
-        }
-        // Allocate right child
-        if node.right_child == 0 {
-            let child_idx = self.nodes.len() as u32;
-            node.right_child = child_idx;
-            self.nodes.push(NumCodeNode::default());
+
+            self.nodes.push(NumCodeNode {
+                context_index: self.next_context,
+                left_child: 0, right_child: 0,
+            });
+            self.nodes.push(NumCodeNode {
+                context_index: self.next_context + 1,
+                left_child: 0, right_child: 0,
+            });
+            self.next_context += 2;
         }
         Ok(())
     }

@@ -2,8 +2,8 @@
 
 // From IW44Image.cpp
 pub const IW_QUANT: [i32; 16] = [
-    0x004000, 0x008000, 0x008000, 0x010000, 0x010000, 0x010000, 0x020000, 0x020000,
-    0x020000, 0x040000, 0x040000, 0x040000, 0x080000, 0x040000, 0x040000, 0x080000,
+    0x004000, 0x008000, 0x008000, 0x010000, 0x010000, 0x010000, 0x020000, 0x020000, 0x020000,
+    0x040000, 0x040000, 0x040000, 0x080000, 0x040000, 0x040000, 0x080000,
 ];
 
 pub const IW_SHIFT: i32 = 6;
@@ -11,10 +11,22 @@ pub const DECIBEL_PRUNE: f32 = 5.0;
 
 // From IW44EncodeCodec.cpp
 pub const IW_NORM: [f32; 16] = [
-    2.627989e+03, 1.832893e+02, 1.832959e+02, 5.114690e+01,
-    4.583344e+01, 4.583462e+01, 1.279225e+01, 1.149671e+01,
-    1.149712e+01, 3.218888e+00, 2.999281e+00, 2.999476e+00,
-    8.733161e-01, 1.074451e+00, 1.074511e+00, 4.289318e-01,
+    2.627989e+03,
+    1.832893e+02,
+    1.832959e+02,
+    5.114690e+01,
+    4.583344e+01,
+    4.583462e+01,
+    1.279225e+01,
+    1.149671e+01,
+    1.149712e+01,
+    3.218888e+00,
+    2.999281e+00,
+    2.999476e+00,
+    8.733161e-01,
+    1.074451e+00,
+    1.074511e+00,
+    4.289318e-01,
 ];
 
 #[derive(Debug, Copy, Clone)]
@@ -31,9 +43,18 @@ pub const BAND_BUCKETS: [BandBucketInfo; 10] = [
     BandBucketInfo { start: 4, size: 4 },
     BandBucketInfo { start: 8, size: 4 },
     BandBucketInfo { start: 12, size: 4 },
-    BandBucketInfo { start: 16, size: 16 },
-    BandBucketInfo { start: 32, size: 16 },
-    BandBucketInfo { start: 48, size: 16 },
+    BandBucketInfo {
+        start: 16,
+        size: 16,
+    },
+    BandBucketInfo {
+        start: 32,
+        size: 16,
+    },
+    BandBucketInfo {
+        start: 48,
+        size: 16,
+    },
 ];
 
 // Generated from the C++ `zigzagloc` array.

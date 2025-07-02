@@ -77,7 +77,7 @@ impl HiddenText {
     pub fn encode(&mut self, writer: &mut impl Write) -> Result<(), HiddenTextError> {
         // 1. Flatten the text from the tree into a single string
         let mut full_text = String::new();
-        self.flatten_text_recursive(&mut self.root_zone, &mut full_text);
+        HiddenText::flatten_text_recursive(&mut self.root_zone, &mut full_text);
 
         // 2. Write the text component
         write_u24(writer, full_text.len() as u32)?;
@@ -92,7 +92,7 @@ impl HiddenText {
     }
     
     /// Recursively walks the tree, collecting text and assigning text offsets.
-    fn flatten_text_recursive(&mut self, zone: &mut Zone, full_text: &mut String) {
+    fn flatten_text_recursive(zone: &mut Zone, full_text: &mut String) {
         if let Some(text) = &zone.text {
             zone.text_start = full_text.len();
             full_text.push_str(text);
@@ -100,7 +100,7 @@ impl HiddenText {
         } else {
             zone.text_start = full_text.len();
             for child in &mut zone.children {
-                self.flatten_text_recursive(child, full_text);
+                HiddenText::flatten_text_recursive(child, full_text);
             }
             zone.text_len = full_text.len() - zone.text_start;
         }

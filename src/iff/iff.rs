@@ -2,11 +2,9 @@
 
 //! A module for reading and writing IFF (Interchange File Format) streams.
 //!
-//! This module replaces the C++ `IFFByteStream` class with a safer, more idiomatic
-//! and composable Rust API. It provides two main structs:
-//! - `IffReader`: For parsing IFF chunks from any source that implements `std::io::Read`.
-//! - `IffWriter`: For creating IFF files on any destination that implements
-//!   `std::io::Write` and `std::io::Seek`.
+//! This module provides:
+//! - `IffReaderExt`: A trait for parsing IFF chunks from any source that implements `Read` and `Seek`.
+//! - `IffWriter`: A struct for creating IFF files on any destination that implements `Write` and `Seek`.
 
 use crate::utils::error::{DjvuError, Result};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
@@ -40,43 +38,9 @@ impl Chunk {
     }
 }
 
-/// A reader for parsing IFF-structured data from a byte stream.
-pub struct IffReader<R: Read> {
-    reader: R,
-}
-
-impl<R: Read> IffReader<R> {
-    /// The 4-byte "AT&T" magic number sometimes found at the start of DjVu files.
-    const MAGIC_ATT: [u8; 4] = [0x41, 0x54, 0x26, 0x54];
-    /// The 4-byte "SDJV" magic number sometimes found at the start of DjVu files.
-    const MAGIC_SDJV: [u8; 4] = [b'S', b'D', b'J', b'V'];
-
-    /// Creates a new `IffReader` that wraps an existing reader.
-    ///
-    /// This constructor will automatically detect and skip the optional 4-byte
-    /// DjVu magic numbers ('AT&T' or 'SDJV') if they are present at the
-    /// beginning of the stream.
-    #[inline]
-    pub fn new(mut reader: R) -> Result<Self> {
-        let mut magic_buf = [0u8; 4];
-        // Peek at the first 4 bytes without consuming them from the main reader.
-        let bytes_read = reader.read(&mut magic_buf)?;
-        if bytes_read == 4 && (magic_buf == Self::MAGIC_ATT || magic_buf == Self::MAGIC_SDJV) {
-            // It's a magic number, so we are done with the buffer.
-        } else {
-            // Not a magic number, so we need to "prepend" the bytes back.
-            // We do this by chaining the buffered bytes with the original reader.
-            let new_reader = magic_buf[..bytes_read].as_ref().chain(reader);
-            return Ok(IffReader {
-                reader: Box::new(new_reader),
-            });
-        }
-
-        Ok(IffReader {
-            reader: Box::new(reader),
-        })
-    }
-
+/// An extension trait for reading IFF-structured data from a seekable stream.
+/// This provides a higher-level API for iterating through chunks.
+pub trait IffReaderExt: Read + Seek {
     /// Reads the next chunk header from the stream.
     ///
     /// On success, returns `Ok(Some(Chunk))`.
@@ -84,28 +48,21 @@ impl<R: Read> IffReader<R> {
     /// On a parsing error, returns `Err(DjvuError)`.
     ///
     /// After calling this, the stream is positioned at the start of the chunk's
-    /// data payload. The caller is responsible for reading `chunk.size` bytes.
-    pub fn next_chunk(&mut self) -> Result<Option<Chunk>> {
-        // Skip padding byte if necessary from the previous chunk.
-        // IFF chunks are padded to an even number of bytes.
-        // We can't know the absolute position, but we can track it.
-        // A more robust implementation might track bytes read. For now, this is
-        // simplified, assuming the caller correctly consumes the data.
-        // A full implementation would need to track its own position.
-
+    /// data payload.
+    fn next_chunk(&mut self) -> Result<Option<Chunk>> {
         let mut id = [0u8; 4];
-        match self.reader.read_exact(&mut id) {
+        match self.read_exact(&mut id) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e.into()),
         }
 
-        let size = self.reader.read_u32::<BigEndian>()?;
+        let size = self.read_u32::<BigEndian>()?;
         let is_composite = matches!(&id, b"FORM" | b"LIST" | b"PROP" | b"CAT ");
 
         let secondary_id = if is_composite {
             let mut sid = [0u8; 4];
-            self.reader.read_exact(&mut sid)?;
+            self.read_exact(&mut sid)?;
             sid
         } else {
             [b' '; 4]
@@ -119,31 +76,43 @@ impl<R: Read> IffReader<R> {
         }))
     }
 
-    /// Provides a limited reader for the current chunk's data payload.
+    /// Reads the data payload of a given chunk.
     ///
-    /// This returns a new reader that will automatically stop after `size` bytes,
-    /// preventing accidental reading past the end of the current chunk.
-    /// This is the primary way to safely read chunk data.
-    #[inline]
-    pub fn take_chunk_reader(self, chunk: &Chunk) -> impl Read {
-        self.reader.take(chunk.size as u64)
+    /// This method reads `chunk.size` bytes from the current stream position
+    /// and returns them in a `Vec<u8>`. It also handles the IFF padding byte
+    /// by seeking past it if necessary.
+    fn get_chunk_data(&mut self, chunk: &Chunk) -> Result<Vec<u8>> {
+        let mut data = vec![0; chunk.size as usize];
+        self.read_exact(&mut data)?;
+
+        // IFF chunks are padded to an even number of bytes.
+        if chunk.size % 2 != 0 {
+            self.seek(SeekFrom::Current(1))?;
+        }
+
+        Ok(data)
     }
 }
 
+// Blanket implementation for any type that is Read + Seek.
+impl<T: Read + Seek> IffReaderExt for T {}
+
 /// A writer for creating IFF-structured data on a byte stream.
 /// The underlying writer must also implement `Seek` to allow for patching chunk sizes.
-pub struct IffWriter<W: Write + Seek> {
-    writer: W,
-    // Stack to hold the file offset of the size field for each open chunk.
+pub trait WriteSeek: Write + Seek {}
+impl<T: Write + Seek> WriteSeek for T {}
+
+pub struct IffWriter<'a> {
+    writer: Box<dyn WriteSeek + 'a>,
     chunk_stack: Vec<u64>,
 }
 
-impl<W: Write + Seek> IffWriter<W> {
+impl<'a> IffWriter<'a> {
     /// Creates a new `IffWriter` that wraps an existing writer.
     #[inline]
-    pub fn new(writer: W) -> Self {
+    pub fn new(writer: impl Write + Seek + 'a) -> Self {
         IffWriter {
-            writer,
+            writer: Box::new(writer),
             chunk_stack: Vec::new(),
         }
     }
@@ -152,7 +121,7 @@ impl<W: Write + Seek> IffWriter<W> {
     /// This should only be called once at the very beginning of the file.
     #[inline]
     pub fn write_magic_bytes(&mut self) -> Result<()> {
-        self.writer.write_all(&IffReader::<&[u8]>::MAGIC_ATT)?;
+        self.writer.write_all(&[0x41, 0x54, 0x26, 0x54])?;
         Ok(())
     }
 
@@ -192,52 +161,80 @@ impl<W: Write + Seek> IffWriter<W> {
         // Calculate the size of the payload.
         let end_pos = self.writer.stream_position()?;
         let payload_start_pos = size_pos + 4; // Position after the size field
-        let mut payload_size = end_pos - payload_start_pos;
+        let payload_size = end_pos - payload_start_pos;
 
         // IFF requires chunks to be padded to an even length.
-        if payload_size % 2 != 0 {
+        let needs_padding = payload_size % 2 != 0;
+        if needs_padding {
             self.writer.write_all(&[0])?;
-            payload_size += 1;
         }
 
-        // Seek back, write the correct size, and return to the end.
+        // Get final position after potential padding
+        let final_pos = self.writer.stream_position()?;
+
+        // Seek back, write the correct size, and return to the final position.
         self.writer.seek(SeekFrom::Start(size_pos))?;
         self.writer.write_u32::<BigEndian>(payload_size as u32)?;
-        self.writer.seek(SeekFrom::Start(end_pos))?;
-
-        // After padding, we may need to seek again to the final position.
-        if payload_size % 2 != 0 {
-             self.writer.seek(SeekFrom::Current(1))?;
-        }
+        self.writer.seek(SeekFrom::Start(final_pos))?;
 
         Ok(())
     }
-    
+
+    /// Returns the current nesting level (number of open chunks).
+    pub fn nesting_level(&self) -> usize {
+        self.chunk_stack.len()
+    }
+
     /// Helper to parse a user-friendly ID string into IFF bytes.
     fn parse_full_id(full_id: &str) -> Result<([u8; 4], Option<[u8; 4]>)> {
         let parts: Vec<_> = full_id.split(':').collect();
         match parts.as_slice() {
             [primary] => {
                 if primary.len() != 4 {
-                    return Err(DjvuError::InvalidArg(format!("Chunk ID must be 4 characters: '{}'", primary)));
+                    return Err(DjvuError::InvalidArg(format!(
+                        "Chunk ID must be 4 characters: '{}'",
+                        primary
+                    )));
                 }
                 Ok((primary.as_bytes().try_into().unwrap(), None))
             }
             [primary, secondary] => {
                 if primary.len() != 4 || secondary.len() > 4 {
-                    return Err(DjvuError::InvalidArg(format!("Composite chunk IDs must be 4 chars: '{}:{}'", primary, secondary)));
+                    return Err(DjvuError::InvalidArg(format!(
+                        "Composite chunk IDs must be 4 chars: '{}:{}'",
+                        primary, secondary
+                    )));
                 }
                 let mut sid_buf = [b' '; 4];
                 sid_buf[..secondary.len()].copy_from_slice(secondary.as_bytes());
                 Ok((primary.as_bytes().try_into().unwrap(), Some(sid_buf)))
             }
-            _ => Err(DjvuError::InvalidArg(format!("Invalid chunk ID format: '{}'", full_id))),
+            _ => Err(DjvuError::InvalidArg(format!(
+                "Invalid chunk ID format: '{}'",
+                full_id
+            ))),
         }
     }
 }
 
+/// An extension trait to provide helper methods for `IffWriter`.
+pub trait IffWriterExt {
+    /// Writes a complete simple chunk (header, data, and padding) to the stream.
+    fn write_chunk(&mut self, id: [u8; 4], data: &[u8]) -> Result<()>;
+}
+
+impl<'a> IffWriterExt for IffWriter<'a> {
+    fn write_chunk(&mut self, id: [u8; 4], data: &[u8]) -> Result<()> {
+        let id_str = std::str::from_utf8(&id)
+            .map_err(|e| DjvuError::InvalidArg(format!("Invalid UTF-8 in chunk ID: {}", e)))?;
+        self.put_chunk(id_str)?;
+        self.write_all(data)?;
+        self.close_chunk()
+    }
+}
+
 // Implement Write for IffWriter to pass through writes to the underlying writer.
-impl<W: Write + Seek> Write for IffWriter<W> {
+impl<'a> Write for IffWriter<'a> {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.writer.write(buf)
@@ -246,5 +243,13 @@ impl<W: Write + Seek> Write for IffWriter<W> {
     #[inline]
     fn flush(&mut self) -> std::io::Result<()> {
         self.writer.flush()
+    }
+}
+
+// Implement Seek for IffWriter to pass through seeks to the underlying writer.
+impl<'a> Seek for IffWriter<'a> {
+    #[inline]
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.writer.seek(pos)
     }
 }

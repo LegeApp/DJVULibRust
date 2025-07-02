@@ -1,15 +1,25 @@
 // src/jb2/error.rs
-use thiserror::Error;
 use crate::encode::zp::zp_codec::ZpCodecError;
+
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Jb2Error {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("I/O or ZPCodec error")]
     Codec(#[from] ZpCodecError),
 
+    #[error("Arithmetic coder error: {0}")]
+    ArithmeticCoder(String),
+
     #[error("Invalid number encountered during encoding: {0}")]
     InvalidNumber(String),
-    
+
+    #[error("Invalid data: {0}")]
+    InvalidData(String),
+
     #[error("Invalid parent shape index provided")]
     InvalidParentShape,
 
@@ -21,10 +31,10 @@ pub enum Jb2Error {
 
     #[error("Bad number range or invalid data: {0}")]
     BadNumber(String),
-    
+
     #[error("Context overflow - too many contexts allocated")]
     ContextOverflow,
-    
+
     #[error("Invalid bitmap dimensions or malformed data")]
     InvalidBitmap,
 }

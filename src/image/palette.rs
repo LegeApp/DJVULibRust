@@ -8,11 +8,89 @@
 //!
 //! Your custom NeuQuant implementation is provided as the default `Quantizer`.
 
-use crate::utils::error::{DjvuError, Result};
 use crate::image::image_formats::{Pixel, Pixmap};
+use crate::utils::error::{DjvuError, Result};
+use bytemuck::{cast_slice, Pod, Zeroable};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use image::Rgb;
-use std::io::{Read, Write};
+use ::image::Rgb;
+use std::io::{Cursor, Read, Write};
+
+// --- Helper trait for u24 operations ---
+trait ReadWriteU24 {
+    fn read_u24<R: Read>(reader: &mut R) -> Result<u32>;
+    fn write_u24<W: Write>(writer: &mut W, value: u32) -> Result<()>;
+}
+
+struct U24Helper;
+
+impl ReadWriteU24 for U24Helper {
+    fn read_u24<R: Read>(reader: &mut R) -> Result<u32> {
+        let mut bytes = [0u8; 3];
+        reader.read_exact(&mut bytes)?;
+        Ok(((bytes[0] as u32) << 16) | ((bytes[1] as u32) << 8) | (bytes[2] as u32))
+    }
+
+    fn write_u24<W: Write>(writer: &mut W, value: u32) -> Result<()> {
+        if value > 0xFFFFFF {
+            return Err(DjvuError::InvalidArg("Value too large for u24".to_string()));
+        }
+        let bytes = [
+            ((value >> 16) & 0xFF) as u8,
+            ((value >> 8) & 0xFF) as u8,
+            (value & 0xFF) as u8,
+        ];
+        writer.write_all(&bytes)?;
+        Ok(())
+    }
+}
+
+// --- Bytemuck-compatible color types ---
+
+/// A BGR color representation that can be safely cast to/from bytes
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+pub struct BgrColor {
+    pub b: u8,
+    pub g: u8,
+    pub r: u8,
+}
+
+/// An RGBA color representation that can be safely cast to/from bytes
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+pub struct RgbaColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+impl From<Rgb<u8>> for BgrColor {
+    fn from(rgb: Rgb<u8>) -> Self {
+        BgrColor {
+            b: rgb.0[2],
+            g: rgb.0[1],
+            r: rgb.0[0],
+        }
+    }
+}
+
+impl From<BgrColor> for Rgb<u8> {
+    fn from(bgr: BgrColor) -> Self {
+        Rgb([bgr.r, bgr.g, bgr.b])
+    }
+}
+
+impl From<Rgb<u8>> for RgbaColor {
+    fn from(rgb: Rgb<u8>) -> Self {
+        RgbaColor {
+            r: rgb.0[0],
+            g: rgb.0[1],
+            b: rgb.0[2],
+            a: 255,
+        }
+    }
+}
 
 // --- Quantizer Trait and Your Implementation ---
 
@@ -33,23 +111,21 @@ pub struct NeuQuantQuantizer {
 impl Quantizer for NeuQuantQuantizer {
     /// Runs the NeuQuant algorithm on the input pixels to generate a palette.
     fn quantize(&self, pixels: &[Rgb<u8>], max_colors: usize) -> Vec<Rgb<u8>> {
-        // The provided NeuQuant code uses RGBA. We adapt our RGB input.
-        let rgba_pixels: Vec<u8> = pixels
+        // Convert RGB to RGBA using bytemuck for efficient zero-copy conversion
+        let rgba_colors: Vec<RgbaColor> = pixels.iter().map(|&rgb| rgb.into()).collect();
+        let rgba_bytes: &[u8] = cast_slice(&rgba_colors);
+
+        let nq = your_neuquant::NeuQuant::new(self.sample_factor, max_colors, rgba_bytes);
+        let palette_rgba_bytes = nq.color_map_rgba();
+
+        // Convert RGBA bytes back to RGB using bytemuck
+        let rgba_colors: &[RgbaColor] = cast_slice(&palette_rgba_bytes);
+        rgba_colors
             .iter()
-            .flat_map(|p| [p.0[0], p.0[1], p.0[2], 255])
-            .collect();
-
-        let nq = your_neuquant::NeuQuant::new(self.sample_factor, max_colors, &rgba_pixels);
-        let palette_rgba = nq.color_map_rgba();
-
-        // Convert the RGBA palette back to RGB for our use.
-        palette_rgba
-            .chunks_exact(4)
-            .map(|c| Rgb([c[0], c[1], c[2]]))
+            .map(|&rgba| Rgb([rgba.r, rgba.g, rgba.b]))
             .collect()
     }
 }
-
 
 // --- Palette Data Structure ---
 
@@ -78,10 +154,13 @@ impl Palette {
             color_indices: Vec::new(),
         }
     }
-    
+
     /// Creates a palette directly from a list of colors.
     pub fn from_colors(colors: Vec<Pixel>) -> Self {
-        Palette { colors, color_indices: Vec::new() }
+        Palette {
+            colors,
+            color_indices: Vec::new(),
+        }
     }
 
     /// Returns the number of colors in the palette.
@@ -107,7 +186,49 @@ impl Palette {
             .map(|(i, _)| i as u16)
             .unwrap_or(0)
     }
-    
+
+    /// Efficiently converts a slice of RGB pixels to color indices using bytemuck operations.
+    pub fn pixels_to_indices(&self, pixels: &[Rgb<u8>]) -> Vec<u16> {
+        pixels
+            .iter()
+            .map(|pixel| self.color_to_index(pixel))
+            .collect()
+    }
+
+    pub fn indices_to_pixels(&self, indices: &[u16]) -> Vec<Rgb<u8>> {
+        indices
+            .iter()
+            .map(|&index| {
+                self.index_to_color(index)
+                    .copied()
+                    .unwrap_or(Rgb([0, 0, 0])) // Default to black for invalid indices
+            })
+            .collect()
+    }
+
+    pub fn set_color_indices(&mut self, indices: Vec<u16>) {
+        self.color_indices = indices;
+    }
+
+    pub fn color_indices_as_bytes(&self) -> &[u8] {
+        cast_slice(&self.color_indices)
+    }
+
+    pub fn set_color_indices_from_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.len() % 2 != 0 {
+            return Err(DjvuError::InvalidArg(
+                "Byte slice length must be even for u16 conversion".to_string(),
+            ));
+        }
+        let mut cursor = Cursor::new(bytes);
+        self.color_indices.clear();
+        while cursor.position() < bytes.len() as u64 {
+            let index = cursor.read_u16::<BigEndian>()?;
+            self.color_indices.push(index);
+        }
+        Ok(())
+    }
+
     /// Returns the color at a given index in the palette.
     #[inline]
     pub fn index_to_color(&self, index: u16) -> Option<&Pixel> {
@@ -116,82 +237,86 @@ impl Palette {
 
     /// Encodes the palette into the DjVu `FGbz` chunk format.
     pub fn encode<W: Write>(&self, writer: &mut W) -> Result<()> {
-        let version = if self.color_indices.is_empty() { 0x00 } else { 0x80 };
+        let version = if self.color_indices.is_empty() {
+            0x00
+        } else {
+            0x80
+        };
         writer.write_u8(version)?;
-        
+
         let palette_size = self.len();
         if palette_size > 65535 {
-            return Err(DjvuError::InvalidOperation("Palette size cannot exceed 65535".to_string()));
+            return Err(DjvuError::InvalidOperation(
+                "Palette size cannot exceed 65535".to_string(),
+            ));
         }
         writer.write_u16::<BigEndian>(palette_size as u16)?;
-        
-        for color in &self.colors {
-            // DjVu palette format is BGR, while `image` crate is RGB.
-            writer.write_all(&[color.0[2], color.0[1], color.0[0]])?;
-        }
+
+        let bgr_colors: Vec<BgrColor> = self.colors.iter().map(|&rgb| rgb.into()).collect();
+        let bgr_bytes: &[u8] = cast_slice(&bgr_colors);
+        writer.write_all(bgr_bytes)?;
 
         if !self.color_indices.is_empty() {
             let data_size = self.color_indices.len();
             if data_size > 0xFF_FFFF {
-                return Err(DjvuError::InvalidOperation("Color index data size cannot exceed 24 bits".to_string()));
+                return Err(DjvuError::InvalidOperation(
+                    "Color index data size cannot exceed 24 bits".to_string(),
+                ));
             }
-            writer.write_u24::<BigEndian>(data_size as u32)?;
+            U24Helper::write_u24(writer, data_size as u32)?;
 
-            // The color indices are compressed with BZZ
-            let mut uncompressed_indices = Vec::with_capacity(data_size * 2);
+            // Write each u16 index in BigEndian
             for &index in &self.color_indices {
-                uncompressed_indices.write_u16::<BigEndian>(index)?;
+                writer.write_u16::<BigEndian>(index)?;
             }
-            
-            // For now, write uncompressed for simplicity.
-            // Replace with call to `bzz.rs` module.
-            // let compressed_indices = crate::bzz::bzz_compress(&uncompressed_indices, 6)?;
-            // writer.write_all(&compressed_indices)?;
-            writer.write_all(&uncompressed_indices)?; // Simplified: writing uncompressed
         }
-        
+
         Ok(())
     }
-    
+
     /// Decodes a palette from the DjVu `FGbz` chunk format. (For completeness)
     pub fn decode<R: Read>(reader: &mut R) -> Result<Self> {
         let version = reader.read_u8()?;
         if (version & 0x7F) != 0 {
-            return Err(DjvuError::Stream("Unsupported DjVuPalette version.".to_string()));
+            return Err(DjvuError::Stream(
+                "Unsupported DjVuPalette version.".to_string(),
+            ));
         }
-        
+
         let palette_size = reader.read_u16::<BigEndian>()? as usize;
-        let mut colors = Vec::with_capacity(palette_size);
-        for _ in 0..palette_size {
-            let mut bgr = [0u8; 3];
-            reader.read_exact(&mut bgr)?;
-            colors.push(Rgb([bgr[2], bgr[1], bgr[0]]));
-        }
+
+        let mut bgr_bytes = vec![0u8; palette_size * 3];
+        reader.read_exact(&mut bgr_bytes)?;
+        let bgr_colors: &[BgrColor] = cast_slice(&bgr_bytes);
+        let colors: Vec<Rgb<u8>> = bgr_colors.iter().map(|&bgr| bgr.into()).collect();
 
         let mut color_indices = Vec::new();
         if (version & 0x80) != 0 {
-            let data_size = reader.read_u24::<BigEndian>()? as usize;
-            // Simplified: Reading uncompressed data for now.
-            // Replace with `bzz_decompress` call.
-            let mut index_data = vec![0u8; data_size * 2];
-            reader.read_exact(&mut index_data)?;
-            let mut cursor = std::io::Cursor::new(index_data);
+            let data_size = U24Helper::read_u24(reader)? as usize;
+
+            // Read the byte slice and parse as BigEndian u16
+            let mut index_bytes = vec![0u8; data_size * 2];
+            reader.read_exact(&mut index_bytes)?;
+            let mut cursor = Cursor::new(&index_bytes);
             for _ in 0..data_size {
-                color_indices.push(cursor.read_u16::<BigEndian>()?);
+                let index = cursor.read_u16::<BigEndian>()?;
+                color_indices.push(index);
             }
         }
 
-        Ok(Palette { colors, color_indices })
+        Ok(Palette {
+            colors,
+            color_indices,
+        })
     }
 }
-
 
 // --- A namespace for your provided NeuQuant code ---
 mod your_neuquant {
     // Paste your entire NeuQuant implementation here.
     // I will paste the code you provided, with minimal changes to make it a valid module.
-    
-    use rayon::prelude::*;
+
+    // Removed unused import: use rayon::prelude::*;
     const CHANNELS: usize = 4;
     const RADIUS_DEC: i32 = 30;
     const ALPHA_BIASSHIFT: i32 = 10;
@@ -256,27 +381,43 @@ mod your_neuquant {
             self.colormap.clear();
             self.bias.clear();
             self.freq.clear();
-    
+
             if self.netsize == 0 {
-                for val in self.netindex.iter_mut() { *val = 0; }
+                for val in self.netindex.iter_mut() {
+                    *val = 0;
+                }
                 return;
             }
-    
+
             let freq_val = 1.0f32 / self.netsize as f32;
             for i in 0..self.netsize {
                 let tmp = i as f32 * 256.0 / self.netsize as f32;
                 let a_init = if self.netsize <= 16 {
                     i as f32 * (255.0 / (self.netsize as f32 - 1.0).max(1.0))
                 } else {
-                    if i < 16 { (i as f32) * 16.0 } else { 255.0 }
+                    if i < 16 {
+                        (i as f32) * 16.0
+                    } else {
+                        255.0
+                    }
                 };
-    
-                self.network.push(Neuron { r: tmp, g: tmp, b: tmp, a: a_init.clamp(0.0, 255.0) });
-                self.colormap.push(Color { r: 0, g: 0, b: 0, a: 255 });
+
+                self.network.push(Neuron {
+                    r: tmp,
+                    g: tmp,
+                    b: tmp,
+                    a: a_init.clamp(0.0, 255.0),
+                });
+                self.colormap.push(Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                });
                 self.freq.push(freq_val);
                 self.bias.push(0.0);
             }
-    
+
             if pixels.len() >= CHANNELS {
                 self.learn(pixels);
             }
@@ -291,20 +432,26 @@ mod your_neuquant {
             n.r -= alpha_scale * (n.r - quad_pix.r);
             n.a -= alpha_scale * (n.a - quad_pix.a);
         }
-    
-        fn alter_neighbour(&mut self, alpha_scale: f32, rad: i32, center_idx: i32, quad_pix: Quad<f32>) {
+
+        fn alter_neighbour(
+            &mut self,
+            alpha_scale: f32,
+            rad: i32,
+            center_idx: i32,
+            quad_pix: Quad<f32>,
+        ) {
             let lo = (center_idx - rad).max(0);
             let hi = (center_idx + rad).min(self.netsize as i32 - 1);
-    
+
             let mut j = center_idx + 1;
             let mut k = center_idx - 1;
             let mut q = 1;
-    
+
             while j <= hi || k >= lo {
                 let rad_sq = (rad * rad) as f32;
                 let factor = (rad_sq - (q * q) as f32) / rad_sq;
                 let local_alpha = alpha_scale * factor;
-    
+
                 if j <= hi {
                     let p = &mut self.network[j as usize];
                     p.b -= local_alpha * (p.b - quad_pix.b);
@@ -324,23 +471,23 @@ mod your_neuquant {
                 q += 1;
             }
         }
-    
+
         fn contest(&mut self, b_pix: f32, g_pix: f32, r_pix: f32, a_pix: f32) -> i32 {
             let mut bestd = f32::MAX;
             let mut bestbiasd = bestd;
             let mut bestpos = -1;
             let mut bestbiaspos = -1;
-    
+
             for i in 0..self.netsize {
                 let n = &self.network[i];
                 let mut dist = (n.b - b_pix).abs();
                 dist += (n.r - r_pix).abs();
-                
+
                 let current_bias = self.bias[i];
                 if dist < bestd || dist < bestbiasd + current_bias {
                     dist += (n.g - g_pix).abs();
                     dist += (n.a - a_pix).abs();
-    
+
                     if dist < bestd {
                         bestd = dist;
                         bestpos = i as i32;
@@ -355,15 +502,17 @@ mod your_neuquant {
                 self.freq[i] -= BETA * current_freq;
                 self.bias[i] += BETAGAMMA * current_freq;
             }
-            
+
             self.freq[bestpos as usize] += BETA;
             self.bias[bestpos as usize] -= BETAGAMMA;
             bestbiaspos
         }
-    
+
         fn learn(&mut self, pixels: &[u8]) {
-            if self.netsize == 0 || pixels.is_empty() { return; }
-    
+            if self.netsize == 0 || pixels.is_empty() {
+                return;
+            }
+
             let initrad = self.netsize as i32 / 8;
             let alphadec = (30 + ((self.samplefac - 1) / 3)).max(1);
             let lengthcount = pixels.len() / CHANNELS;
@@ -373,31 +522,42 @@ mod your_neuquant {
             let mut alpha = INIT_ALPHA;
             let mut rad = initrad.max(1);
             let mut pos = 0;
-            let step = *PRIMES.iter().find(|&&p| lengthcount % p != 0).unwrap_or(&PRIMES[3]);
-    
+            let step = *PRIMES
+                .iter()
+                .find(|&&p| lengthcount % p != 0)
+                .unwrap_or(&PRIMES[3]);
+
             for i in 0..samplepixels {
                 let p = &pixels[((pos % lengthcount) * CHANNELS)..];
-                let quad_pix = Quad { r: p[0] as f32, g: p[1] as f32, b: p[2] as f32, a: p[3] as f32 };
-                
-                let winning_neuron_idx = self.contest(quad_pix.b, quad_pix.g, quad_pix.r, quad_pix.a);
+                let quad_pix = Quad {
+                    r: p[0] as f32,
+                    g: p[1] as f32,
+                    b: p[2] as f32,
+                    a: p[3] as f32,
+                };
+
+                let winning_neuron_idx =
+                    self.contest(quad_pix.b, quad_pix.g, quad_pix.r, quad_pix.a);
                 let alpha_scale = (alpha as f32) / (INIT_ALPHA as f32);
-    
+
                 self.salter_single(alpha_scale, winning_neuron_idx, quad_pix);
                 if rad > 0 {
                     self.alter_neighbour(alpha_scale, rad, winning_neuron_idx, quad_pix);
                 }
-    
+
                 pos += step;
-    
+
                 if (i + 1) % delta == 0 {
                     alpha -= alpha / alphadec;
                     let bias_radius = rad * (1 << 6);
                     rad = (bias_radius - (bias_radius / RADIUS_DEC)) >> 6;
-                    if rad <= 1 { rad = 0; }
+                    if rad <= 1 {
+                        rad = 0;
+                    }
                 }
             }
         }
-    
+
         fn build_colormap(&mut self) {
             for i in 0..self.netsize {
                 self.colormap[i].b = (self.network[i].b.max(0.0).min(255.0) + 0.5) as i32;
@@ -406,7 +566,7 @@ mod your_neuquant {
                 self.colormap[i].a = (self.network[i].a.max(0.0).min(255.0) + 0.5) as i32;
             }
         }
-    
+
         fn build_netindex(&mut self) {
             self.colormap.sort_unstable_by_key(|c| c.g);
             let mut previouscol = 0;

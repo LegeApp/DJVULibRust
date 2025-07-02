@@ -10,7 +10,7 @@
 //! This provides a robust, performant, and well-tested compression solution
 //! without needing to reimplement the algorithm from scratch.
 
-use crate::utils::error::{DjvuError, Result};
+use crate::utils::error::Result;
 use bzip2::read::BzDecoder;
 use bzip2::write::BzEncoder;
 use bzip2::Compression;
@@ -71,8 +71,8 @@ mod tests {
         // Compress the data
         let compressed = bzz_compress(original_data, compression_level).unwrap();
 
-        // The compressed data should be smaller than the original.
-        assert!(compressed.len() < original_data.len());
+        // The compressed data is not guaranteed to be smaller, especially for small inputs.
+        // The critical test is that the decompressed data matches the original.
         println!(
             "Original size: {}, Compressed size: {}",
             original_data.len(),
@@ -85,7 +85,7 @@ mod tests {
         // The result should match the original data.
         assert_eq!(original_data, decompressed.as_slice());
     }
-    
+
     #[test]
     fn test_compress_empty_data() {
         let original_data = b"";
@@ -100,15 +100,15 @@ mod tests {
     fn test_highly_compressible_data() {
         let original_data = vec![b'a'; 10_000];
         let compressed = bzz_compress(&original_data, 9).unwrap();
-        
+
         // Should compress extremely well
-        assert!(compressed.len() < 100); 
+        assert!(compressed.len() < 100);
         println!(
             "Original size: {}, Compressed size: {}",
             original_data.len(),
             compressed.len()
         );
-        
+
         let decompressed = bzz_decompress(&compressed).unwrap();
         assert_eq!(original_data, decompressed);
     }

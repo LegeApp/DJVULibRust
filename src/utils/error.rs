@@ -9,12 +9,21 @@ pub enum DjvuError {
     Io(std::io::Error),
     /// An error occurred during encoding or decoding of data streams.
     Stream(String),
+    /// An error occurred during the encoding process.
+    EncodingError(String),
     /// An invalid argument was provided to a function.
     InvalidArg(String),
     /// The requested operation is not supported or invalid in the current context.
     InvalidOperation(String),
     /// A required component or resource was not found.
     NotFound(String),
+    /// The DjVu file format validation failed.
+    ValidationError(String),
+    /// Occurs when image dimensions do not match the expected dimensions.
+    DimensionMismatch {
+        expected: (u32, u32),
+        actual: (u32, u32),
+    },
 }
 
 // Implement the standard Error trait to be a good citizen in the Rust ecosystem.
@@ -33,9 +42,16 @@ impl fmt::Display for DjvuError {
         match self {
             DjvuError::Io(err) => write!(f, "I/O error: {}", err),
             DjvuError::Stream(msg) => write!(f, "Stream error: {}", msg),
+            DjvuError::EncodingError(msg) => write!(f, "Encoding error: {}", msg),
             DjvuError::InvalidArg(msg) => write!(f, "Invalid argument: {}", msg),
             DjvuError::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
             DjvuError::NotFound(msg) => write!(f, "Not found: {}", msg),
+            DjvuError::ValidationError(msg) => write!(f, "Validation error: {}", msg),
+            DjvuError::DimensionMismatch { expected, actual } => write!(
+                f,
+                "Dimension mismatch: expected ({}, {}), but got ({}, {})",
+                expected.0, expected.1, actual.0, actual.1
+            ),
         }
     }
 }
@@ -44,6 +60,12 @@ impl fmt::Display for DjvuError {
 impl From<std::io::Error> for DjvuError {
     fn from(err: std::io::Error) -> Self {
         DjvuError::Io(err)
+    }
+}
+
+impl From<crate::encode::jb2::error::Jb2Error> for DjvuError {
+    fn from(err: crate::encode::jb2::error::Jb2Error) -> Self {
+        DjvuError::EncodingError(format!("JB2 encoding error: {}", err))
     }
 }
 

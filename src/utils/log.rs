@@ -45,7 +45,7 @@ pub fn init_subscriber(max_level: Level) {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(max_level)
         .with_thread_ids(true) // Replicates the thread ID logging from the C++ version
-        .with_target(false)    // Don't print the module path
+        .with_target(false) // Don't print the module path
         .finish();
 
     tracing::subscriber::set_global_default(subscriber)

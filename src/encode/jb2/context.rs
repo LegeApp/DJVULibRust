@@ -1,184 +1,204 @@
 // src/jb2/context.rs
 
-// JB2 adaptive context functions (ported from JB2Image.h)
+use crate::arithmetic_coder::Jb2ArithmeticEncoder;
+use crate::encode::jb2::error::Jb2Error;
+use crate::encode::jb2::symbol_dict::BitImage;
+use std::io::Write;
 
-/// Compute the initial direct coding context.
+//-----------------------------------------------------------------------------
+// DIRECT CODING (for dictionary symbols)
+//-----------------------------------------------------------------------------
+
+/// Compute the direct context for a pixel in a `BitImage`.
+///
+/// This is a 10-bit context used for encoding new symbols into the dictionary.
+/// It only considers pixels from the image being encoded.
+/// This function safely handles boundary conditions by treating any pixel
+/// outside the image as white (false).
 #[inline]
-pub fn get_direct_context(
-    up2: &[u8],
-    up1: &[u8],
-    up0: &[u8],
-    column: usize,
-) -> usize {
-    ((up2[column - 1] as usize) << 9)
-        | ((up2[column] as usize) << 8)
-        | ((up2[column + 1] as usize) << 7)
-        | ((up1[column - 2] as usize) << 6)
-        | ((up1[column - 1] as usize) << 5)
-        | ((up1[column] as usize) << 4)
-        | ((up1[column + 1] as usize) << 3)
-        | ((up1[column + 2] as usize) << 2)
-        | ((up0[column - 2] as usize) << 1)
-        | ((up0[column - 1] as usize) << 0)
+fn get_direct_context_image(image: &BitImage, x: i32, y: i32) -> usize {
+    let get_pixel = |x: i32, y: i32| -> usize {
+        if x < 0 || y < 0 || x >= image.width as i32 || y >= image.height as i32 {
+            0 // Pixels outside the boundary are considered white (0).
+        } else {
+            image.get_pixel_unchecked(x as usize, y as usize) as usize
+        }
+    };
+
+    (get_pixel(x - 1, y - 2) << 9) |
+    (get_pixel(x,     y - 2) << 8) |
+    (get_pixel(x + 1, y - 2) << 7) |
+    (get_pixel(x - 2, y - 1) << 6) |
+    (get_pixel(x - 1, y - 1) << 5) |
+    (get_pixel(x,     y - 1) << 4) |
+    (get_pixel(x + 1, y - 1) << 3) |
+    (get_pixel(x + 2, y - 1) << 2) |
+    (get_pixel(x - 2, y)     << 1) |
+    (get_pixel(x - 1, y)     << 0)
 }
 
-/// Update the direct coding context with the next pixel.
+//-----------------------------------------------------------------------------
+// REFINEMENT CODING (for symbol instances)
+//-----------------------------------------------------------------------------
+
+/// Compute the refinement context for a pixel in `current` image, using `reference`
+/// as the predictor.
+///
+/// This is a 13-bit context used for refinement coding. It combines information
+/// from a 3x3 window in the reference symbol and a causal region of 4 pixels
+/// in the symbol instance being coded.
+///
+/// This function safely handles boundary conditions by treating any pixel
+/// outside the image as white (false).
 #[inline]
-pub fn shift_direct_context(
-    context: usize,
-    next: u8,
-    up2: &[u8],
-    up1: &[u8],
-    up0: &[u8],
-    column: usize,
+fn get_refinement_context(
+    current: &BitImage,
+    reference: &BitImage,
+    x: i32,
+    y: i32,
+    cx_offset: i32,
+    cy_offset: i32,
 ) -> usize {
-    ((context << 1) & 0x37a)
-        | ((up1[column + 2] as usize) << 2)
-        | ((up2[column + 1] as usize) << 7)
-        | ((next as usize) << 0)
+    let get_current_pixel = |x: i32, y: i32| -> usize {
+        if x < 0 || y < 0 || x >= current.width as i32 || y >= current.height as i32 {
+            0
+        } else {
+            current.get_pixel_unchecked(x as usize, y as usize) as usize
+        }
+    };
+
+    let get_ref_pixel = |x: i32, y: i32| -> usize {
+        let rx = x + cx_offset;
+        let ry = y + cy_offset;
+        if rx < 0 || ry < 0 || rx >= reference.width as i32 || ry >= reference.height as i32 {
+            0
+        } else {
+            reference.get_pixel_unchecked(rx as usize, ry as usize) as usize
+        }
+    };
+
+    // 9 bits from the reference image (3x3 neighborhood)
+    (get_ref_pixel(x - 1, y - 1) << 0) |
+    (get_ref_pixel(x,     y - 1) << 1) |
+    (get_ref_pixel(x + 1, y - 1) << 2) |
+    (get_ref_pixel(x - 1, y)     << 3) |
+    (get_ref_pixel(x,     y)     << 4) |
+    (get_ref_pixel(x + 1, y)     << 5) |
+    (get_ref_pixel(x - 1, y + 1) << 6) |
+    (get_ref_pixel(x,     y + 1) << 7) |
+    (get_ref_pixel(x + 1, y + 1) << 8) |
+    // 4 bits from the already-coded part of the current image
+    (get_current_pixel(x - 1, y)       << 9) |
+    (get_current_pixel(x, y - 1)       << 10) |
+    (get_current_pixel(x - 1, y - 1)   << 11) |
+    (get_current_pixel(x - 2, y - 1)   << 12)
 }
 
-/// Compute the initial cross coding context.
-#[inline]
-pub fn get_cross_context(
-    up1: &[u8],
-    up0: &[u8],
-    xup1: &[u8],
-    xup0: &[u8],
-    xdn1: &[u8],
-    column: usize,
-) -> usize {
-    ((up1[column - 1] as usize) << 10)
-        | ((up1[column] as usize) << 9)
-        | ((up1[column + 1] as usize) << 8)
-        | ((up0[column - 1] as usize) << 7)
-        | ((xup1[column] as usize) << 6)
-        | ((xup0[column - 1] as usize) << 5)
-        | ((xup0[column] as usize) << 4)
-        | ((xup0[column + 1] as usize) << 3)
-        | ((xdn1[column - 1] as usize) << 2)
-        | ((xdn1[column] as usize) << 1)
-        | ((xdn1[column + 1] as usize) << 0)
-}
 
-/// Update the cross coding context with the next pixel.
-#[inline]
-pub fn shift_cross_context(
-    context: usize,
-    n: u8,
-    up1: &[u8],
-    up0: &[u8],
-    xup1: &[u8],
-    xup0: &[u8],
-    xdn1: &[u8],
-    column: usize,
-) -> usize {
-    ((context << 1) & 0x636)
-        | ((up1[column + 1] as usize) << 8)
-        | ((xup1[column] as usize) << 6)
-        | ((xup0[column + 1] as usize) << 3)
-        | ((xdn1[column + 1] as usize) << 0)
-        | ((n as usize) << 7)
-}
+/// Encodes a `BitImage` using refinement/cross-coding against a reference bitmap.
+///
+/// This is used to encode a symbol instance that is a refinement of a symbol
+/// from the dictionary.
+pub fn encode_bitmap_refine<W: Write>(
+    ac: &mut Jb2ArithmeticEncoder<W>,
+    image: &BitImage,
+    reference: &BitImage,
+    cx_offset: i32, // relative offset of `image` from `reference`
+    cy_offset: i32,
+    base_context_index: usize,
+) -> Result<(), Jb2Error> {
+    // We need a temporary image to store the pixels we've already coded
+    let mut temp_image = BitImage::new(
+        image.width.try_into().map_err(|_| Jb2Error::InvalidData("Width too large".to_string()))?,
+        image.height.try_into().map_err(|_| Jb2Error::InvalidData("Height too large".to_string()))?
+    ).map_err(|e| Jb2Error::InvalidData(e.to_string()))?;
 
-/// Wrapper for get_direct_context that works with GrayImage
-pub fn get_direct_context_image(
-    image: &image::GrayImage,
-    x: u32,
-    y: u32,
-) -> Result<usize, crate::encode::jb2::error::Jb2Error> {
-    let width = image.width();
-    let height = image.height();
-    
-    // Ensure we have enough padding for context window
-    if x < 2 || y < 2 || x >= width - 2 || y >= height - 2 {
-        return Ok(0); // Use default context for edge cases
+    for y in 0..image.height as i32 {
+        for x in 0..image.width as i32 {
+            // Get the context for this pixel using both the reference and already-coded pixels
+            let context = get_refinement_context_with_base(
+                &temp_image, 
+                reference, 
+                x, 
+                y, 
+                cx_offset, 
+                cy_offset
+            );
+            
+            // Get the pixel value and encode it
+            let pixel = image.get_pixel_unchecked(x as usize, y as usize);
+            ac.encode_bit(context + base_context_index, pixel)?;
+            
+            // Update the temporary image with the pixel we just coded
+            if pixel {
+                temp_image.set_usize(x as usize, y as usize, true);
+            }
+        }
     }
-    
-    // Extract row data as slices
-    let up2_row: Vec<u8> = (0..width).map(|col| image.get_pixel(col, y - 2).0[0]).collect();
-    let up1_row: Vec<u8> = (0..width).map(|col| image.get_pixel(col, y - 1).0[0]).collect();
-    let up0_row: Vec<u8> = (0..width).map(|col| image.get_pixel(col, y).0[0]).collect();
-    
-    // Convert binary pixels (0 or 255) to binary (0 or 1)
-    let up2_binary: Vec<u8> = up2_row.iter().map(|&p| if p > 127 { 1 } else { 0 }).collect();
-    let up1_binary: Vec<u8> = up1_row.iter().map(|&p| if p > 127 { 1 } else { 0 }).collect();
-    let up0_binary: Vec<u8> = up0_row.iter().map(|&p| if p > 127 { 1 } else { 0 }).collect();
-    
-    Ok(get_direct_context(&up2_binary, &up1_binary, &up0_binary, x as usize))
+    Ok(())
 }
 
-/// Wrapper for get_cross_context that works with GrayImage
-pub fn get_cross_context_image(
-    current_image: &image::GrayImage,
-    reference_image: &image::GrayImage,
-    x: u32,
-    y: u32,
-    xd2c: i32,
-    cy: i32,
-) -> Result<usize, crate::encode::jb2::error::Jb2Error> {
-    let width = current_image.width();
-    let height = current_image.height();
-    
-    // Ensure we have enough padding for context window
-    if x < 1 || y < 1 || x >= width - 1 || y >= height - 1 {
-        return Ok(0); // Use default context for edge cases
+/// Encodes a full `BitImage` using the 10-bit direct coding context.
+///
+/// This function uses an efficient, row-based approach to minimize redundant
+/// calculations and boundary checks, making it suitable for encoding entire symbols.
+pub fn encode_bitmap_direct<W: Write>(
+    ac: &mut Jb2ArithmeticEncoder<W>,
+    image: &BitImage,
+    base_context_index: usize,
+) -> Result<(), Jb2Error> {
+    // Process the image row by row
+    for y in 0..image.height as i32 {
+        for x in 0..image.width as i32 {
+            // Get the context for this pixel
+                        let context = get_direct_context_image(image, x, y);
+            let final_context = base_context_index + context;
+            
+            // Get the pixel value and encode it
+            let pixel = image.get_pixel_unchecked(x as usize, y as usize);
+            ac.encode_bit(final_context, pixel)?
+        }
     }
-    
-    // Calculate reference coordinates with offset
-    let ref_x = (x as i32 + xd2c).max(0).min((reference_image.width() - 1) as i32) as u32;
-    let ref_y = (y as i32 + cy).max(0).min((reference_image.height() - 1) as i32) as u32;
-    
-    // Extract current image rows
-    let up1_row: Vec<u8> = (0..width).map(|col| {
-        if y > 0 { 
-            let p = current_image.get_pixel(col, y - 1).0[0];
-            if p > 127 { 1 } else { 0 }
-        } else { 0 }
-    }).collect();
-    
-    let up0_row: Vec<u8> = (0..width).map(|col| {
-        let p = current_image.get_pixel(col, y).0[0];
-        if p > 127 { 1 } else { 0 }
-    }).collect();
-    
-    // Extract reference image rows
-    let ref_width = reference_image.width();
-    let ref_height = reference_image.height();
-    
-    let xup1_row: Vec<u8> = (0..ref_width).map(|col| {
-        if ref_y > 0 {
-            let p = reference_image.get_pixel(col, ref_y - 1).0[0];
-            if p > 127 { 1 } else { 0 }
-        } else { 0 }
-    }).collect();
-    
-    let xup0_row: Vec<u8> = (0..ref_width).map(|col| {
-        let p = reference_image.get_pixel(col, ref_y).0[0];
-        if p > 127 { 1 } else { 0 }
-    }).collect();
-    
-    let xdn1_row: Vec<u8> = (0..ref_width).map(|col| {
-        if ref_y + 1 < ref_height {
-            let p = reference_image.get_pixel(col, ref_y + 1).0[0];
-            if p > 127 { 1 } else { 0 }
-        } else { 0 }
-    }).collect();
-    
-    // Ensure reference coordinates are within bounds for context calculation
-    let safe_ref_x = ref_x.min(ref_width - 2).max(1) as usize;
-    
-    Ok(get_cross_context(
-        &up1_row, 
-        &up0_row, 
-        &xup1_row, 
-        &xup0_row, 
-        &xdn1_row, 
-        safe_ref_x
-    ))
+    Ok(())
 }
 
-pub struct Context {
-    pub direct: usize,
-    pub cross: usize,
+/// Gets the context for a pixel in the current image, using a reference image
+/// for prediction. This is used during refinement coding.
+fn get_refinement_context_with_base(
+    current: &BitImage,
+    reference: &BitImage,
+    x: i32,
+    y: i32,
+    cx_offset: i32,
+    cy_offset: i32,
+) -> usize {
+    let get_current_pixel = |x: i32, y: i32| -> usize {
+        if x < 0 || y < 0 || x >= current.width as i32 || y >= current.height as i32 {
+            0
+        } else {
+            current.get_pixel_unchecked(x as usize, y as usize) as usize
+        }
+    };
+
+    let get_ref_pixel = |x: i32, y: i32| -> usize {
+        let rx = x + cx_offset;
+        let ry = y + cy_offset;
+        if rx < 0 || ry < 0 || rx >= reference.width as i32 || ry >= reference.height as i32 {
+            0
+        } else {
+            reference.get_pixel_unchecked(rx as usize, ry as usize) as usize
+        }
+    };
+
+    (get_current_pixel(x - 1, y - 1) << 10) |
+    (get_current_pixel(x,     y - 1) << 9)  |
+    (get_current_pixel(x + 1, y - 1) << 8)  |
+    (get_current_pixel(x - 1, y)     << 7)  |
+    (get_ref_pixel(x,     y - 1) << 6)  |
+    (get_ref_pixel(x - 1, y)     << 5)  |
+    (get_ref_pixel(x,     y)     << 4)  |
+    (get_ref_pixel(x + 1, y)     << 3)  |
+    (get_ref_pixel(x - 1, y + 1) << 2)  |
+    (get_ref_pixel(x,     y + 1) << 1)  |
+    (get_ref_pixel(x + 1, y + 1) << 0)
 }

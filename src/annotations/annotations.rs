@@ -1,8 +1,8 @@
 // src/annotations.rs
 
-use thiserror::Error;
-use std::io::Write;
 use std::fmt;
+use std::io::Write;
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AnnotationError {
@@ -62,22 +62,29 @@ impl Annotations {
     /// being stored in a final DjVu file as an 'ANTz' chunk.
     pub fn encode(&self, writer: &mut impl Write) -> Result<(), AnnotationError> {
         for link in &self.hyperlinks {
-            let url_part = format!("(url \"{}\" \"{}\")", escape_str(&link.url), escape_str(&link.target));
+            let url_part = format!(
+                "(url \"{}\" \"{}\")",
+                escape_str(&link.url),
+                escape_str(&link.target)
+            );
             let comment_part = format!("\"{}\"", escape_str(&link.comment));
             let shape_part = format!("{}", link.shape);
-            
+
             // The full format is `(maparea <url> <comment> <shape> <options...>)`
-            let maparea = format!("(maparea {} {} {} (none))", url_part, comment_part, shape_part);
+            let maparea = format!(
+                "(maparea {} {} {} (none))",
+                url_part, comment_part, shape_part
+            );
             writer.write_all(maparea.as_bytes())?;
         }
-        
+
         if !self.metadata.is_empty() {
-             let mut meta_str = String::from("(metadata");
-             for (key, value) in &self.metadata {
-                 meta_str.push_str(&format!(" ({} \"{}\")", escape_str(key), escape_str(value)));
-             }
-             meta_str.push(')');
-             writer.write_all(meta_str.as_bytes())?;
+            let mut meta_str = String::from("(metadata");
+            for (key, value) in &self.metadata {
+                meta_str.push_str(&format!(" ({} \"{}\")", escape_str(key), escape_str(value)));
+            }
+            meta_str.push(')');
+            writer.write_all(meta_str.as_bytes())?;
         }
 
         Ok(())

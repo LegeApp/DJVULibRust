@@ -7,8 +7,8 @@
 //! trait, `DjvuImageExt`, is defined to add DjVu-specific rendering operations
 //! like `stencil` and `attenuate` directly to these standard image types.
 
-use crate::utils::geom::Rect;
-use image::{ImageBuffer, Luma, Rgb, RgbImage, GrayImage as LumaImage};
+use crate::image::geom::Rect;
+use ::image::{GrayImage as LumaImage, Luma, Rgb, RgbImage};
 
 // --- Type Aliases for Clarity ---
 
@@ -50,7 +50,7 @@ pub trait DjvuImageExt {
     /// * `x_pos`, `y_pos` - The top-left position to apply the blend.
     /// * `color` - The solid color to blend onto the image.
     fn blit_solid(&mut self, mask: &Bitmap, x_pos: i32, y_pos: i32, color: &Pixel);
-    
+
     /// Blends a foreground pixmap onto a background pixmap using an alpha mask.
     ///
     /// This is the core "stencil" operation for compositing DjVu layers.
@@ -80,7 +80,7 @@ impl DjvuImageExt for Pixmap {
         let multipliers: Vec<u32> = (0..=grays)
             .map(|i| 0x10000 * i as u32 / grays as u32)
             .collect();
-        
+
         for y in 0..overlap.height {
             for x in 0..overlap.width {
                 let self_x = (overlap.x + x as i32) as u32;
@@ -89,18 +89,23 @@ impl DjvuImageExt for Pixmap {
                 let mask_y = (self_y as i32 - y_pos) as u32;
 
                 let alpha_val = mask.get_pixel(mask_x, mask_y).0[0];
-                if alpha_val == 0 { continue; }
+                if alpha_val == 0 {
+                    continue;
+                }
 
                 let bg_pixel = self.get_pixel_mut(self_x, self_y);
-                
+
                 if alpha_val == 255 {
                     // Fully opaque mask, color becomes black.
                     *bg_pixel = Rgb([0, 0, 0]);
                 } else {
                     let level = multipliers[alpha_val as usize];
-                    bg_pixel.0[0] = (bg_pixel.0[0] as u32 - ((bg_pixel.0[0] as u32 * level) >> 16)) as u8;
-                    bg_pixel.0[1] = (bg_pixel.0[1] as u32 - ((bg_pixel.0[1] as u32 * level) >> 16)) as u8;
-                    bg_pixel.0[2] = (bg_pixel.0[2] as u32 - ((bg_pixel.0[2] as u32 * level) >> 16)) as u8;
+                    bg_pixel.0[0] =
+                        (bg_pixel.0[0] as u32 - ((bg_pixel.0[0] as u32 * level) >> 16)) as u8;
+                    bg_pixel.0[1] =
+                        (bg_pixel.0[1] as u32 - ((bg_pixel.0[1] as u32 * level) >> 16)) as u8;
+                    bg_pixel.0[2] =
+                        (bg_pixel.0[2] as u32 - ((bg_pixel.0[2] as u32 * level) >> 16)) as u8;
                 }
             }
         }
@@ -111,7 +116,9 @@ impl DjvuImageExt for Pixmap {
         let mask_rect = Rect::new(x_pos, y_pos, mask.width(), mask.height());
         let overlap = self_rect.intersection(&mask_rect);
 
-        if overlap.is_empty() { return; }
+        if overlap.is_empty() {
+            return;
+        }
 
         let multipliers: Vec<u32> = (0..=255).map(|i| 0x10000 * i as u32 / 255).collect();
 
@@ -123,19 +130,24 @@ impl DjvuImageExt for Pixmap {
                 let mask_y = (self_y as i32 - y_pos) as u32;
 
                 let alpha_val = mask.get_pixel(mask_x, mask_y).0[0];
-                if alpha_val == 0 { continue; }
-                
+                if alpha_val == 0 {
+                    continue;
+                }
+
                 let dest_pixel = self.get_pixel_mut(self_x, self_y);
-                
+
                 if alpha_val == 255 {
                     dest_pixel.0[0] = dest_pixel.0[0].saturating_add(color.0[0]);
                     dest_pixel.0[1] = dest_pixel.0[1].saturating_add(color.0[1]);
                     dest_pixel.0[2] = dest_pixel.0[2].saturating_add(color.0[2]);
                 } else {
                     let level = multipliers[alpha_val as usize];
-                    dest_pixel.0[0] = dest_pixel.0[0].saturating_add(((color.0[0] as u32 * level) >> 16) as u8);
-                    dest_pixel.0[1] = dest_pixel.0[1].saturating_add(((color.0[1] as u32 * level) >> 16) as u8);
-                    dest_pixel.0[2] = dest_pixel.0[2].saturating_add(((color.0[2] as u32 * level) >> 16) as u8);
+                    dest_pixel.0[0] =
+                        dest_pixel.0[0].saturating_add(((color.0[0] as u32 * level) >> 16) as u8);
+                    dest_pixel.0[1] =
+                        dest_pixel.0[1].saturating_add(((color.0[1] as u32 * level) >> 16) as u8);
+                    dest_pixel.0[2] =
+                        dest_pixel.0[2].saturating_add(((color.0[2] as u32 * level) >> 16) as u8);
                 }
             }
         }
@@ -146,8 +158,10 @@ impl DjvuImageExt for Pixmap {
         let op_rect = Rect::new(x_pos, y_pos, mask.width(), mask.height());
         let overlap = self_rect.intersection(&op_rect);
 
-        if overlap.is_empty() { return; }
-        
+        if overlap.is_empty() {
+            return;
+        }
+
         // This is a direct port of the logic:
         // C' = C_bg - (C_bg - C_fg) * Alpha
         // which is equivalent to: C_bg * (1 - Alpha) + C_fg * Alpha
@@ -159,9 +173,11 @@ impl DjvuImageExt for Pixmap {
                 let self_y = (overlap.y + y as i32) as u32;
                 let mask_x = (self_x as i32 - x_pos) as u32;
                 let mask_y = (self_y as i32 - y_pos) as u32;
-                
+
                 let alpha_val = mask.get_pixel(mask_x, mask_y).0[0];
-                if alpha_val == 0 { continue; }
+                if alpha_val == 0 {
+                    continue;
+                }
 
                 let bg_pixel = self.get_pixel_mut(self_x, self_y);
                 let fg_pixel = foreground.get_pixel(mask_x, mask_y);
