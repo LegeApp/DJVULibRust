@@ -1,7 +1,10 @@
 // tests/iw44_encoding_tests.rs
 
-use djvu_encoder::encode::iw44::{encoder::*, transform};
-use image::{GrayImage, Luma, Rgb, RgbImage};
+use djvu_encoder::encode::iw44::{encoder::*};
+use djvu_encoder::encode::iw44::transform::{Encode, Decode};
+use image::{GrayImage, Rgb, RgbImage, DynamicImage};
+use std::io::{Cursor, Read};
+use byteorder::ReadBytesExt;
 
 /// Test IW44 encoder with a simple grayscale image
 #[test]
@@ -76,7 +79,7 @@ fn test_iff_structure_validator() {
     encoder.add_page(page).unwrap();
     let mut buf = Vec::new();
     encoder.write_to(&mut buf).expect("Failed to encode DjVu");
-    let mut cursor = std::io::Cursor::new(&buf);
+    let mut cursor = Cursor::new(&buf);
 
     // 1) Magic "AT&T"
     let mut magic = [0u8; 4];
@@ -113,22 +116,35 @@ fn test_iff_structure_validator() {
 /// Test: IW44 wavelet transform round-trip
 #[test]
 fn test_transform_round_trip() {
-    // Basic 8x8 impulse test (already present)
-    use djvu_encoder::encode::iw44::transform;
+    // Generate a simple 8x8 impulse image
     let mut img = vec![vec![0f32; 8]; 8];
     img[3][4] = 255.0;
-    let coeffs = transform::forward(&img);
-    let recon = transform::inverse(&coeffs);
+    
+    // Apply wavelet transform manually (since we don't have direct access to transform::forward)
+    let mut test_data = Vec::with_capacity(64);
+    for row in &img {
+        for val in row {
+            test_data.push(*val as i16);
+        }
+    }
+    
+    // Forward then backward transform
+    Encode::forward(&mut test_data, 8, 8, 8, 1, 3);
+    Decode::backward(&mut test_data, 8, 8, 8, 1, 3);
+    
+    // Compare results
     let mut mse = 0.0;
     for y in 0..8 {
         for x in 0..8 {
-            let diff = img[y][x] - recon[y][x];
+            let recon_val = test_data[y*8 + x] as f32;
+            let diff = img[y][x] - recon_val;
             mse += diff * diff;
         }
     }
     mse /= 64.0;
     let psnr = if mse == 0.0 { 99.9 } else { 10.0 * ((255.0 * 255.0) / mse).log10() };
     assert!(psnr > 40.0, "PSNR too low: {}", psnr);
+    // If this passes, transform round-trip is correct
 }
 
 /// Test: Wavelet round-trip for various patterns and sizes
@@ -143,7 +159,7 @@ fn test_wavelet_roundtrip_various_patterns() {
         ("constant", 32, 32),
     ];
     for (pattern, width, height) in test_cases {
-        let result = super::test_wavelet_round_trip(width, height, pattern);
+        let result = test_wavelet_round_trip(width, height, pattern);
         assert!(result.passed, "Pattern '{}' failed round-trip test", pattern);
     }
 }
@@ -151,14 +167,14 @@ fn test_wavelet_roundtrip_various_patterns() {
 /// Test: Wavelet round-trip for small image
 #[test]
 fn test_wavelet_roundtrip_small_image() {
-    let result = super::test_wavelet_round_trip(8, 8, "ramp");
+    let result = test_wavelet_round_trip(8, 8, "ramp");
     assert!(result.passed, "Small image round-trip test failed");
 }
 
 /// Test: Wavelet round-trip for power-of-2 size
 #[test]
 fn test_wavelet_roundtrip_power_of_two() {
-    let result = super::test_wavelet_round_trip(64, 64, "gradient");
+    let result = test_wavelet_round_trip(64, 64, "gradient");
     assert!(result.passed, "Power-of-2 round-trip test failed");
 }
 
@@ -175,7 +191,7 @@ fn test_transform_round_trip_comprehensive() {
         (32, 32, "constant"),
     ];
     for (width, height, pattern) in test_cases {
-        let original = super::generate_test_pattern(width, height, pattern);
+        let original = generate_test_pattern(width, height, pattern);
         let mut test_data = original.clone();
         let begin = 1;
         let end = std::cmp::min(5, std::cmp::min(
@@ -184,7 +200,7 @@ fn test_transform_round_trip_comprehensive() {
         ));
         Encode::forward(&mut test_data, width, height, width, begin, end);
         Decode::backward(&mut test_data, width, height, width, begin, end);
-        let result = super::calculate_error_metrics(&original, &test_data);
+        let result = calculate_error_metrics(&original, &test_data);
         assert!(result.psnr > 99.0 || result.is_perfect,
                 "Transform round-trip failed for {} {}x{}: PSNR {:.1} dB",
                 pattern, width, height, result.psnr);
@@ -205,13 +221,13 @@ fn test_iff_structure_comprehensive() {
             img.put_pixel(x, y, image::Luma([value]));
         }
     }
-    let page = PageComponents::new().with_background(image::DynamicImage::ImageLuma8(img)).unwrap();
+    let page = PageComponents::new().with_background(RgbImage::from(image::DynamicImage::ImageLuma8(img))).unwrap();
     let mut encoder = DocumentEncoder::new();
     encoder.add_page(page).unwrap();
     let mut buf = Vec::new();
     encoder.write_to(&mut buf).expect("Failed to encode DjVu");
     // Now validate IFF structure
-    let mut cursor = std::io::Cursor::new(&buf);
+    let mut cursor = Cursor::new(&buf);
     let mut magic = [0u8; 4];
     cursor.read_exact(&mut magic).unwrap();
     assert_eq!(&magic, b"AT&T");
@@ -238,13 +254,12 @@ fn test_iff_structure_comprehensive() {
 // --- Helpers for transform tests ---
 
 fn generate_test_pattern(width: usize, height: usize, pattern: &str) -> Vec<i16> {
-    // ... (copy from src/validate/transform_tests.rs)
     let mut data = vec![0i16; width * height];
     match pattern {
         "impulse" => { data[width / 2 + (height / 2) * width] = 255; },
         "ramp" => { for y in 0..height { for x in 0..width { data[y * width + x] = (x + y) as i16; } } },
         "checkerboard" => { for y in 0..height { for x in 0..width { data[y * width + x] = if (x + y) % 2 == 0 { 127 } else { -127 }; } } },
-        "gradient" => { for y in 0..height { for x in 0..width { data[y * width + x] = (x * 255 / (width as i16)) as i16; } } },
+        "gradient" => { for y in 0..height { for x in 0..width { data[y * width + x] = ((x * 255) / width) as i16; } } },
         "constant" => { for val in data.iter_mut() { *val = 42; } },
         _ => {},
     }
@@ -298,32 +313,6 @@ fn test_wavelet_round_trip(width: usize, height: usize, pattern: &str) -> Wavele
     Encode::forward(&mut test_data, width, height, width, begin, end);
     Decode::backward(&mut test_data, width, height, width, begin, end);
     calculate_error_metrics(&original, &test_data)
-}
-
-    use djvu_encoder::encode::iw44::transform;
-    // Generate a simple 8x8 impulse image
-    let mut img = vec![vec![0f32; 8]; 8];
-    img[3][4] = 255.0;
-    // Forward transform
-    let coeffs = transform::forward(&img);
-    // Inverse transform
-    let recon = transform::inverse(&coeffs);
-    // Compute PSNR
-    let mut mse = 0.0;
-    for y in 0..8 {
-        for x in 0..8 {
-            let diff = img[y][x] - recon[y][x];
-            mse += diff * diff;
-        }
-    }
-    mse /= 64.0;
-    let psnr = if mse == 0.0 { 99.9 } else { 10.0 * ((255.0 * 255.0) / mse).log10() };
-    assert!(psnr > 40.0, "PSNR too low: {}", psnr);
-    // If this passes, transform round-trip is correct
-
-        chunk.len(),
-        more
-    );
 }
 
 /// Test IW44 encoder with an RGB image
