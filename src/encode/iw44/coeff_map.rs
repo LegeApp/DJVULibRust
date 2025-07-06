@@ -98,7 +98,7 @@ impl CoeffMap {
     /// Private helper to copy a 32x32 block from the transform buffer to a liftblock
     fn copy_block_data(
         liftblock: &mut [i16; 1024], 
-        data16: &[i16], 
+        data32: &[i32], 
         bw: usize, 
         block_x: usize, 
         block_y: usize
@@ -110,8 +110,11 @@ impl CoeffMap {
             let src_y = data_start_y + i;
             let src_offset = src_y * bw + data_start_x;
             let dst_offset = i * 32;
-            liftblock[dst_offset..dst_offset + 32]
-                .copy_from_slice(&data16[src_offset..src_offset + 32]);
+            
+            // Convert from i32 to i16 with clamping
+            for j in 0..32 {
+                liftblock[dst_offset + j] = data32[src_offset + j].clamp(-32768, 32767) as i16;
+            }
         }
     }
 
@@ -122,18 +125,23 @@ impl CoeffMap {
         mask: Option<&GrayImage>,
         transform_fn: F
     ) -> Self 
-    where F: FnOnce(&mut [i16], usize, usize, usize)
+    where F: FnOnce(&mut [i32], usize, usize)
     {
         let mut map = Self::new(width, height);
         
-        // Allocate decomposition buffer (padded)
-        let mut data16 = vec![0i16; map.bw * map.bh];
+        // Allocate decomposition buffer (padded) - now using i32
+        let mut data32 = vec![0i32; map.bw * map.bh];
 
-        // Apply transform function to populate data16
-        transform_fn(&mut data16, map.iw, map.ih, map.bw);
+        // Apply transform function to populate data32
+        // Note: Transform works on the full padded buffer (bw x bh), not just image size (iw x ih)
+        transform_fn(&mut data32, map.bw, map.bh);
 
         // Apply masking logic if mask is provided
         if let Some(mask_img) = mask {
+            // For now, masking functions still work with i16 data, so we need to convert
+            // TODO: Update masking functions to work with i32 data
+            let mut data16 = data32.iter().map(|&x| x.clamp(-32768, 32767) as i16).collect::<Vec<_>>();
+            
             // Convert mask image to signed i8 array using masking helper
             let mask8 = masking::image_to_mask8(mask_img, map.bw, map.ih);
             
@@ -142,6 +150,11 @@ impl CoeffMap {
 
             // Apply forward_mask for multiscale masked wavelet decomposition
             masking::forward_mask(&mut data16, map.iw, map.ih, map.bw, 1, 32, &mask8, map.bw);
+            
+            // Convert back to i32
+            for (dst, &src) in data32.iter_mut().zip(data16.iter()) {
+                *dst = src as i32;
+            }
         }
 
         // Copy transformed coefficients into blocks
@@ -151,7 +164,7 @@ impl CoeffMap {
                 let block_idx = block_y * blocks_w + block_x;
                 let mut liftblock = [0i16; 1024];
 
-                Self::copy_block_data(&mut liftblock, &data16, map.bw, block_x, block_y);
+                Self::copy_block_data(&mut liftblock, &data32, map.bw, block_x, block_y);
                 map.blocks[block_idx].read_liftblock(&liftblock);
             }
         }
@@ -162,8 +175,8 @@ impl CoeffMap {
     /// Create coefficients from an image. Corresponds to `Map::Encode::create`.
     pub fn create_from_image(img: &GrayImage, mask: Option<&GrayImage>) -> Self {
         let (w, h) = img.dimensions();
-        Self::create_from_transform(w as usize, h as usize, mask, |data16, w, h, bw| {
-            Encode::from_u8_image(img, data16, w, h, bw);
+        Self::create_from_transform(w as usize, h as usize, mask, |data32, w, h| {
+            Encode::from_u8_image(img, data32, w, h);
         })
     }
 
@@ -174,8 +187,8 @@ impl CoeffMap {
         height: u32, 
         mask: Option<&GrayImage>
     ) -> Self {
-        Self::create_from_transform(width as usize, height as usize, mask, |data16, w, h, bw| {
-            Encode::from_i8_channel(y_buf, data16, w, h, bw);
+        Self::create_from_transform(width as usize, height as usize, mask, |data32, w, h| {
+            Encode::from_i8_channel(y_buf, data32, w, h);
         })
     }
 
@@ -188,8 +201,8 @@ impl CoeffMap {
         mask: Option<&GrayImage>,
         _channel_name: &str  // Keep for API compatibility but don't use for debug
     ) -> Self {
-        Self::create_from_transform(width as usize, height as usize, mask, |data16, w, h, bw| {
-            Encode::from_i8_channel(channel_buf, data16, w, h, bw);
+        Self::create_from_transform(width as usize, height as usize, mask, |data32, w, h| {
+            Encode::from_i8_channel(channel_buf, data32, w, h);
         })
     }
 

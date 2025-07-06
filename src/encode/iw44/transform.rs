@@ -1,6 +1,4 @@
-// Remove unused imports
-use rayon::prelude::*;
-use std::simd::Simd;
+use std::simd::{LaneCount, Simd, SupportedLaneCount};
 
 use super::constants::IW_SHIFT;
 use ::image::GrayImage;
@@ -25,502 +23,387 @@ pub struct Encode;
 impl Encode {
     /// Forward wavelet transform using the lifting scheme.
     /// Port of `IW44Image::Transform::Encode::forward` from DjVuLibre.
-    /// Uses horizontal then vertical filtering per scale, as per DjVu specification.
+    /// Uses vertical then horizontal filtering per scale, as per DjVu specification.
+    /// This order is critical for preserving DC coefficients in solid color images.
     ///
     /// # Arguments
-    /// * `p` - Coefficient data to transform (modified in-place)
+    /// * `buf` - Coefficient data to transform (modified in-place)
     /// * `w` - Image width
     /// * `h` - Image height
-    /// * `rowsize` - Row stride 
-    /// * `begin` - Starting scale index (0 = scale 1, 1 = scale 2, etc.)
-    /// * `end` - Ending scale index (exclusive)
-    pub fn forward(p: &mut [i16], w: usize, h: usize, rowsize: usize, begin: usize, end: usize) {
-        for i in begin..end {
-            let scale = 1 << i;
-            filter_fv(p, w, h, rowsize, scale);
-            filter_fh_parallel(p, w, h, rowsize, scale);
+    /// * `levels` - Number of decomposition levels
+    pub fn forward<const LANES: usize>(
+        buf: &mut [i32],
+        w: usize,
+        h: usize,
+        levels: usize,
+    ) where
+        LaneCount<LANES>: SupportedLaneCount,
+    {
+        // Work on progressively smaller low-pass rectangles
+        let mut cur_w = w;
+        let mut cur_h = h;
+
+        for level in 0..levels {
+            let scale = 1 << level;  // Scale factor for this level
+            
+            // Vertical, then horizontal, on the top-left (low-pass) area only
+            // This order is critical to preserve DC coefficients exactly
+            fwt_vertical_inplace_single_level::<LANES>(buf, w, cur_w, cur_h, scale);
+            fwt_horizontal_inplace_single_level::<LANES>(buf, w, cur_w, cur_h, scale);
+
+            // Next scale works on the even samples only
+            cur_w = (cur_w + 1) / 2;
+            cur_h = (cur_h + 1) / 2;
         }
     }
     
     /// Prepare image data for wavelet transform with proper pixel shifting and centering.
-    /// This handles the conversion from various input formats to the i16 buffer format expected by the transform.
+    /// This handles the conversion from various input formats to the i32 buffer format expected by the transform.
     pub fn prepare_and_transform<F>(
-        data16: &mut [i16], 
+        data32: &mut [i32], 
         w: usize, 
         h: usize, 
-        bw: usize, 
         pixel_fn: F
-    ) where F: Fn(usize, usize) -> i16 
+    ) where F: Fn(usize, usize) -> i32 
     {
         // Copy pixels with proper shifting
         for y in 0..h {
             for x in 0..w {
-                data16[y * bw + x] = pixel_fn(x, y);
+                data32[y * w + x] = pixel_fn(x, y);
             }
         }
         
-        // Apply forward transform with standard parameters (scales 1, 2, 4, 8, 16)
-        Self::forward(data16, w, h, bw, 0, 5);
+        // Debug: Check input data before transform
+        let sample_indices = [0, w/4, w/2, 3*w/4, w-1];
+        let mut input_samples = Vec::new();
+        let mut min_val = i32::MAX;
+        let mut max_val = i32::MIN;
+        let mut unique_vals = std::collections::HashSet::new();
+        
+        for y in 0..std::cmp::min(h, 5) { // Check first 5 rows
+            for x in &sample_indices {
+                if *x < w {
+                    let val = data32[y * w + *x];
+                    input_samples.push(val);
+                    min_val = min_val.min(val);
+                    max_val = max_val.max(val);
+                    if unique_vals.len() < 10 {
+                        unique_vals.insert(val);
+                    }
+                }
+            }
+        }
+        
+        println!("DEBUG Transform input (after {} shift):", IW_SHIFT);
+        println!("  Input range: {} to {} (span: {})", min_val, max_val, max_val - min_val);
+        println!("  Unique values: {:?}", unique_vals);
+        println!("  Sample values: {:?}", input_samples);
+        
+        // Apply forward transform with appropriate number of levels
+        // For WxH image, max levels = floor(log2(min(W, H)))
+        let max_levels = ((w.min(h) as f64).log2().floor() as usize).max(1);
+        Self::forward::<4>(data32, w, h, max_levels);
+        
+        // Debug: Check coefficients after transform
+        let mut coeff_min = i32::MAX;
+        let mut coeff_max = i32::MIN;
+        let mut coeff_samples = Vec::new();
+        let mut zero_count = 0;
+        let mut nonzero_count = 0;
+        
+        for y in 0..std::cmp::min(h, 5) { // Check first 5 rows
+            for x in &sample_indices {
+                if *x < w {
+                    let coeff = data32[y * w + *x];
+                    coeff_samples.push(coeff);
+                    coeff_min = coeff_min.min(coeff);
+                    coeff_max = coeff_max.max(coeff);
+                    if coeff == 0 {
+                        zero_count += 1;
+                    } else {
+                        nonzero_count += 1;
+                    }
+                }
+            }
+        }
+        
+        // Check DC coefficient (should be average of image for solid color)
+        let dc_coeff = data32[0];
+        
+        println!("DEBUG Transform output:");
+        println!("  DC coefficient (0,0): {}", dc_coeff);
+        println!("  Coeff range: {} to {} (span: {})", coeff_min, coeff_max, coeff_max as i32 - coeff_min as i32);
+        println!("  Sample coefficients: {:?}", coeff_samples);
+        println!("  Zero coeffs: {}, Nonzero coeffs: {}", zero_count, nonzero_count);
+        
+        // For solid color, we expect mostly zeros except for DC
+        if zero_count > nonzero_count * 10 {
+            println!("  *** SPARSE COEFFICIENTS - good for compression! ***");
+        } else {
+            println!("  *** WARNING: Too many non-zero coefficients for solid color! ***");
+        }
     }
     
     /// Helper for unsigned 8-bit image data (like GrayImage)
-    pub fn from_u8_image(img: &GrayImage, data16: &mut [i16], w: usize, h: usize, bw: usize) {
-        Self::prepare_and_transform(data16, w, h, bw, |x, y| {
-            let pixel_u8 = img.get_pixel(x as u32, y as u32)[0] as i16;
+    pub fn from_u8_image(img: &GrayImage, data32: &mut [i32], w: usize, h: usize) {
+        Self::prepare_and_transform(data32, w, h, |x, y| {
+            let pixel_u8 = img.get_pixel(x as u32, y as u32)[0] as i32;
             pixel_u8 << IW_SHIFT
         });
     }
     
     /// Helper for signed 8-bit channel data (Y, Cb, Cr)
-    pub fn from_i8_channel(channel_buf: &[i8], data16: &mut [i16], w: usize, h: usize, bw: usize) {
-        Self::prepare_and_transform(data16, w, h, bw, |x, y| {
-            let idx = y * w + x;
+    pub fn from_i8_channel(channel_buf: &[i8], data32: &mut [i32], w: usize, h: usize) {
+        let img_w = if channel_buf.len() >= w * h { w } else { 
+            // For smaller images, compute actual width
+            let pixels = channel_buf.len();
+            if pixels > 0 && h > 0 { 
+                std::cmp::min(w, pixels / h)
+            } else { 
+                w 
+            }
+        };
+        let img_h = if channel_buf.len() >= w * h { h } else {
+            // For smaller images, compute actual height
+            let pixels = channel_buf.len();
+            if pixels > 0 && img_w > 0 { 
+                std::cmp::min(h, pixels / img_w)
+            } else { 
+                h 
+            }
+        };
+        
+        Self::prepare_and_transform(data32, w, h, |x, y| {
+            // Use mirroring for coordinates outside the actual image bounds
+            let mirror_x = if x >= img_w {
+                mirror(x as isize, img_w)
+            } else {
+                x
+            };
+            let mirror_y = if y >= img_h {
+                mirror(y as isize, img_h)
+            } else {
+                y
+            };
+            
+            let idx = mirror_y * img_w + mirror_x;
             if idx < channel_buf.len() {
                 let pixel_i8 = channel_buf[idx];
-                (pixel_i8 as i16) << IW_SHIFT
+                (pixel_i8 as i32) << IW_SHIFT
             } else {
-                0
+                // Fallback: use last pixel value
+                if channel_buf.len() > 0 {
+                    (channel_buf[channel_buf.len() - 1] as i32) << IW_SHIFT
+                } else {
+                    0
+                }
             }
         });
     }
 }
 
-/// Optimized symmetric boundary extension (mirroring) for wavelet transforms.
-/// This function handles out-of-bounds indices by reflecting them back into the valid range.
-/// This is essential for the lifting scheme used in IW44 wavelets to avoid boundary artifacts.
-///
-/// # Arguments
-/// * `val` - The potentially out-of-bounds index
-/// * `max` - The maximum valid index (exclusive)
-///
-/// # Returns
-/// A valid index within [0, max) using symmetric mirroring
+/// Mirror index for boundaries: even symmetry around 0 and around size-1
+/// Ported from DjVuLibre.
 #[inline]
-pub fn mirror(i: isize, max: isize) -> usize {
-    if max <= 0 {
-        return 0; // Safe fallback for invalid max values
+fn mirror(mut k: isize, size: usize) -> usize {
+    if size == 0 {
+        return 0;
     }
-    let mut v = i;
-    
-    // Handle negative indices by reflection: -1 -> 0, -2 -> 1, etc.
-    if v < 0 {
-        v = -v - 1;
+    let size = size as isize;
+    if k < 0 {
+        k = -k;
     }
-    
-    // Handle indices >= max by reflection
-    if v >= max {
-        v = 2 * max - 1 - v;
+    let period = (size - 1) * 2;
+    k %= period;
+    if k >= size {
+        k = period - k;
     }
-    
-    // Clamp to ensure valid range [0, max)
-    if v < 0 || v >= max {
-        v = 0; // Fallback for edge cases
-    }
-    
-    v as usize
+    k as usize
 }
 
-/// Vertical lifting filter for forward transform.
-/// Implements the Deslauriers-Dubuc (4,4) interpolating wavelet lifting scheme.
-/// Uses symmetric boundary extension via the mirror function.
+/// Convenience wrapper: *horizontal → vertical* forward IW-44 transform.
 ///
-/// Predict:  d[n] = x_o[n] - (-x_e[n-1] + 9*x_e[n] + 9*x_e[n+1] - x_e[n+2]) / 16
-/// Update:   x_e[n] += (-d[n-1] + 9*d[n] + 9*d[n+1] - d[n+2]) / 32
+/// Call this instead of the two passes if you just want the full 2-D
+/// decomposition in one line.
 ///
-/// # Arguments
-/// * `p` - Coefficient data (modified in-place)
-/// * `w` - Image width
-/// * `h` - Image height
-/// * `rowsize` - Row stride
-/// * `scale` - Current scale (1, 2, 4, 8, 16, ...)
-// Define SIMD types for 16-bit integers (4 lanes to match MMX)
-// Type alias removed (moved to top of file)
+/// # Example
+/// ```rust
+/// fwt_forward_inplace::<8>(&mut image, w, h, /*levels=*/5);
+/// quantise_inplace(&mut image, w, h, quant_table);
+/// ```
 
-/// Vertical filter function for wavelet transform, refactored to use SIMD and parallelization.
+/// In-place *vertical* pass for **one** decomposition level.
 ///
-/// # Arguments
-/// - `p`: Mutable slice of i16 representing the 2D image buffer.
-/// - `w`: Width of the image in pixels.
-/// - `h`: Height of the image in pixels.
-/// - `rowsize`: Number of elements (shorts) per row.
-/// - `scale`: Scaling factor for the transform.
-fn filter_fv(p: &mut [i16], w: usize, h: usize, rowsize: usize, scale: usize) {
-    let s = scale * rowsize;
-    let s3 = 3 * s;
-    let mut y = 0;
-    let mut p_idx = 0;
-    let h_scaled = ((h - 1) / scale) + 1;
-
-    while y < h_scaled {
-        // 1. Lifting Step
-        {
-            let row_y = p_idx;
-            let row_start = row_y;
-            let row_end = row_start + w;
-
-            if y >= 3 && y + 3 < h_scaled {
-                // Generic case: Use SIMD and parallelization when scale == 1
-                if scale == 1 {
-                    // Process in chunks for better cache locality
-                    let chunk_size = 64;
-                    let chunks: Vec<_> = (0..w).collect();
-                    let chunks = chunks.chunks(chunk_size).collect::<Vec<_>>();
-                    let chunk_results: Vec<Vec<i16>> = chunks.par_iter().map(|chunk| {
-                        let start = chunk[0];
-                        let end = chunk[chunk.len() - 1] + 1;
-                        let mut temp = vec![0i16; end - start];
-                        let mut i = start;
-                        // SIMD processing for blocks of 4 columns
-                        while i + 4 <= end && i + 4 <= w {
-                            unsafe {
-                                let b = I16x4::from_slice(&p[(row_y - s + i)..(row_y - s + i + 4)]);
-                                let c = I16x4::from_slice(&p[(row_y + s + i)..(row_y + s + i + 4)]);
-                                let a = I16x4::from_slice(&p[(row_y - s3 + i)..(row_y - s3 + i + 4)]);
-                                let d = I16x4::from_slice(&p[(row_y + s3 + i)..(row_y + s3 + i + 4)]);
-
-                                let sum_bc = b + c;
-                                let sum_ad = a + d;
-
-                                // Calculate the new values using SIMD operations
-                                let temp_simd = {
-                                    let sum_bc = b + c;
-                                    let sum_ad = a + d;
-                                    let temp = (sum_bc * Simd::splat(9) - sum_ad + Simd::splat(16)) >> 5;
-                                    let q = I16x4::from_slice(&p[row_y + i..row_y + i + 4]);
-                                    q - temp
-                                };
-
-                                // Store SIMD result back to memory
-                                for j in 0..4 {
-                                    temp[(i + j) - start] = temp_simd[j];
-                                }
-                            }
-                            i += 4;
-                        }
-
-                        // Remaining elements in the chunk (less than 4)
-                        while i < end {
-                            let a = p[row_y - s + i] as i32 + p[row_y + s + i] as i32;
-                            let b = p[row_y - s3 + i] as i32 + p[row_y + s3 + i] as i32;
-                            let delta = (((a * 9) - b + 16) >> 5);
-                            temp[i - start] = sat16(p[row_y + i] as i32 - delta);
-                            i += 1;
-                        }
-                        temp
-                    }).collect();
-                    // Copy results back to original array
-                    for (i, val) in chunk_results.iter().enumerate() {
-                        for (j, &v) in val.iter().enumerate() {
-                            if i * chunk_size + j < w {
-                                p[row_y + i * chunk_size + j] = v;
-                            }
-                        }
-                    }
-                } else {
-                    // Scalar code for scale != 1
-                    let mut i = row_start;
-                    while i < row_end {
-                        let a = p[i - s] as i32 + p[i + s] as i32;
-                        let b = p[i - s3] as i32 + p[i + s3] as i32;
-                        let delta = (((a * 9) - b + 16) >> 5);
-                        p[i] = sat16(p[i] as i32 - delta);
-                        i += scale;
-                    }
-                }
-            } else if y < h_scaled {
-                // Boundary cases: Scalar processing
-                let mut i = row_start;
-                let q1_offset = if y + 1 < h_scaled { s } else { 0 };
-                let q3_offset = if y + 3 < h_scaled { s3 } else { 0 };
-
-                if y >= 3 {
-                    while i < row_end {
-                        let a = p[i - s] as i32 + if q1_offset != 0 { p[i + q1_offset] as i32 } else { 0 };
-                        let b = p[i - s3] as i32 + if q3_offset != 0 { p[i + q3_offset] as i32 } else { 0 };
-                        let delta = (((a * 9) - b + 16) >> 5);
-                        p[i] = sat16(p[i] as i32 - delta);
-                        i += scale;
-                    }
-                } else if y >= 1 {
-                    while i < row_end {
-                        let a = p[i - s] as i32 + if q1_offset != 0 { p[i + q1_offset] as i32 } else { 0 };
-                        let b = if q3_offset != 0 { p[i + q3_offset] as i32 } else { 0 };
-                        let delta = (((a * 9) - b + 16) >> 5);
-                        p[i] = sat16(p[i] as i32 - delta);
-                        i += scale;
-                    }
-                } else {
-                    while i < row_end {
-                        let a = if q1_offset != 0 { p[i + q1_offset] as i32 } else { 0 };
-                        let b = if q3_offset != 0 { p[i + q3_offset] as i32 } else { 0 };
-                        let delta = (((a * 9) - b + 16) >> 5);
-                        p[i] = sat16(p[i] as i32 - delta);
-                        i += scale;
-                    }
-                }
-            }
-        }
-
-        // 2. Interpolation Step
-        {
-            let row_y = p_idx.saturating_sub(s3);
-            let row_start = row_y;
-            let row_end = row_start + w;
-
-            if y >= 6 && y < h_scaled {
-                // Generic case: Use SIMD and parallelization when scale == 1
-                if scale == 1 {
-                    // Process in chunks for better cache locality
-                    let chunk_size = 64;
-                    let chunks: Vec<_> = (0..w).collect();
-                    let chunks = chunks.chunks(chunk_size).collect::<Vec<_>>();
-                    let chunk_results: Vec<Vec<i16>> = chunks.par_iter().map(|chunk| {
-                        let start = chunk[0];
-                        let end = chunk[chunk.len() - 1] + 1;
-                        let mut temp = vec![0i16; end - start];
-                        let mut i = start;
-                        // SIMD processing for blocks of 4 columns
-                        while i + 4 <= end && i + 4 <= w {
-                            unsafe {
-                                let b = I16x4::from_slice(&p[(row_y - s + i)..(row_y - s + i + 4)]);
-                                let c = I16x4::from_slice(&p[(row_y + s + i)..(row_y + s + i + 4)]);
-                                let a = I16x4::from_slice(&p[(row_y - s3 + i)..(row_y - s3 + i + 4)]);
-                                let d = I16x4::from_slice(&p[(row_y + s3 + i)..(row_y + s3 + i + 4)]);
-
-                                let sum_bc = b + c;
-                                let sum_ad = a + d;
-
-                                // Calculate the new values using SIMD operations
-                                let result = {
-                                    let sum_bc = b + c;
-                                    let sum_ad = a + d;
-                                    let temp = (sum_bc * Simd::splat(9) - sum_ad + Simd::splat(8)) >> 4;
-                                    let q = I16x4::from_slice(&p[row_y + i..row_y + i + 4]);
-                                    q + temp
-                                };
-
-                                // Store SIMD result back to memory
-                                for j in 0..4 {
-                                    temp[(i + j) - start] = result[j];
-                                }
-                            }
-                            i += 4;
-                        }
-
-                        // Remaining elements in the chunk (less than 4)
-                        while i < end {
-                            let a = p[row_y - s + i] as i32 + p[row_y + s + i] as i32;
-                            let b = p[row_y - s3 + i] as i32 + p[row_y + s3 + i] as i32;
-                            temp[i - start] = p[row_y + i] + (((a * 9) - b + 8) >> 4) as i16;
-                            i += 1;
-                        }
-                        temp
-                    }).collect();
-                    // Copy results back to original array
-                    for (i, val) in chunk_results.iter().enumerate() {
-                        for (j, &v) in val.iter().enumerate() {
-                            if i * chunk_size + j < w {
-                                p[row_y + i * chunk_size + j] = v;
-                            }
-                        }
-                    }
-                } else {
-                    // Scalar code for scale != 1
-                    let mut i = row_start;
-                    while i < row_end {
-                        let a = p[i - s] as i32 + p[i + s] as i32;
-                        let b = p[i - s3] as i32 + p[i + s3] as i32;
-                        let delta = (((a * 9) - b + 8) >> 4);
-                        p[i] = sat16(p[i] as i32 + delta);
-                        i += scale;
-                    }
-                }
-            } else if y >= 4 {
-                // Boundary cases: Scalar processing
-                let mut i = row_start;
-                // Convert to isize to allow negative offsets
-                let q1_offset = if y >= 2 && y - 2 < h_scaled { 
-                    s 
-                } else if y < 2 { 
-                    // Convert to isize for negative offset, then back to usize with bounds checking
-                    (y as isize - s as isize).max(0) as usize 
-                } else { 
-                    0 
-                };
-                let q3_offset = if y + 2 < h_scaled { s3 } else { 0 };
-                while i < row_end {
-                    let a = p[i - s] as i32 + p[i + q1_offset] as i32;
-                    let delta = ((a + 1) >> 1);
-                    p[i] = sat16(p[i] as i32 + delta);
-                    i += scale;
-                }
-            }
-        }
-
-        y += 2;
-        p_idx += 2 * s;
-    }
-}
-
-
-// Define a common SIMD type alias for clarity, matching the provided code.
-
-
-/// Horizontal filter for the IW44 wavelet transform.
+/// * `buf`  – pixel buffer (row-major).
+/// * `full_w` – full image width (for row addressing).
+/// * `work_w/work_h` – working rectangle dimensions to process.
+/// * `scale` – current scale (1 << level).
 ///
-/// This function applies the lifting and update steps of the wavelet transform horizontally
-/// across each specified row of the image buffer. It is parallelized using Rayon to process
-/// multiple rows concurrently.
-///
-/// The logic from the original C code, which interleaves two dependent computation steps,
-/// has been separated into a clearer two-pass system (Lifting, then Update) to ensure
-/// data correctness in a parallel context and improve code clarity.
-///
-/// Due to the non-contiguous (strided) memory access pattern inherent in the horizontal
-/// filter (e.g., accessing `p[x-s]`, `p[x]`, `p[x+s]`), this implementation uses a scalar
-/// approach within each row. Unlike the vertical filter, standard SIMD loads are not
-/// effective here without complex, and often inefficient, gather/shuffle operations. The
-/// primary performance gain comes from processing rows in parallel.
-///
-/// # Arguments
-/// - `p`: Mutable slice of `i16` representing the 2D image buffer.
-/// - `w`: Width of the image in pixels.
-/// - `h`: Height of the image in pixels.
-/// - `rowsize`: The number of `i16` elements per row in memory (stride).
-/// - `scale`: The scaling factor `s` for the current wavelet level.
-fn filter_fh_parallel(p: &mut [i16], w: usize, h: usize, rowsize: usize, scale: usize) {
-    if w == 0 || h == 0 {
+/// Processes only the current level at the given scale.
+pub fn fwt_vertical_inplace_single_level<const LANES: usize>(
+    buf: &mut [i32],
+    full_w: usize,
+    work_w: usize,
+    work_h: usize,
+    scale: usize,
+) where
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    // If the working height is smaller than the scale, the transform is a no-op.
+    if work_h <= scale {
         return;
     }
 
-    // Process rows in parallel. The C code iterates `y += scale`, so we process
-    // blocks of `scale` rows and operate on the first row of each block.
-    // `par_chunks_mut` provides safe, mutable, and disjoint slices for each thread.
-    p.par_chunks_mut(rowsize * scale)
-        .take(h / scale) // Ensure we don't process padding rows if h is not a multiple of scale
-        .for_each(|block| {
-            // Each thread operates on a single row from its assigned block.
-            let row = &mut block[0..w];
-            filter_fh(row, w, scale);
-        });
-}
+    assert!(
+        buf.len() >= work_h * full_w,
+        "buffer length must be at least work_h * full_w"
+    );
 
-/// Processes a single row with the horizontal wavelet filter logic.
-///
-/// This function contains the core two-pass algorithm:
-/// 1.  **Lifting Pass**: Computes the new values for the even-indexed coefficients based on
-///     their odd-indexed neighbors. The results are stored in a temporary buffer to prevent
-///     modifying the row before the next pass has read all original values.
-/// 2.  **Update Pass**: Writes the new even coefficients back to the row and then calculates
-///     the update for the odd-indexed coefficients using these new values.
-fn filter_fh(row: &mut [i16], w: usize, scale: usize) {
-    let s = scale;
-    let s2 = 2 * s;
-    let s3 = 3 * s;
-
-    // A temporary buffer to hold the new values for the even-indexed coefficients (`b` values).
-    // This de-interleaves the calculation, which is crucial for correctness and clarity.
-    let num_even = (w + s2 - 1) / s2;
-    let mut b_coeffs = Vec::with_capacity(num_even);
-
-    // --- Pass 1: Lifting Step ---
-    // Calculate new coefficients for all even positions `x = 0, 2s, 4s, ...`
-    // We read only from the original `row` and store results in `b_coeffs`.
-    for i in 0..num_even {
-        let x = i * s2;
-
-        // Boundary-safe reads using symmetric mirroring instead of zero-padding
-        let idx_minus_s3 = mirror(x as isize - s3 as isize, w as isize);
-        let idx_minus_s = mirror(x as isize - s as isize, w as isize);
-        let idx_plus_s = mirror(x as isize + s as isize, w as isize);
-        let idx_plus_s3 = mirror(x as isize + s3 as isize, w as isize);
+    // Process columns sequentially within the working rectangle
+    for col in 0..work_w {
+        // Create a vector to hold this column's data
+        let mut col_vec = vec![0i32; work_h];
         
-        let p_x_minus_s3 = row[idx_minus_s3];
-        let p_x_minus_s = row[idx_minus_s];
-        let p_x_plus_s = row[idx_plus_s];
-        let p_x_plus_s3 = row[idx_plus_s3];
-
-        let neighbors_1s = p_x_minus_s as i32 + p_x_plus_s as i32;
-        let neighbors_3s = p_x_minus_s3 as i32 + p_x_plus_s3 as i32;
-
-        // The lifting formula from the IW44 update step.
-        let delta = (((neighbors_1s * 9) - neighbors_3s + 16) >> 5) as i16;
-        b_coeffs.push(row[x].wrapping_sub(delta));
-    }
-
-    // --- Pass 2: Update Step ---
-    // First, write the new `b` coefficients back to the even positions in the row.
-    for i in 0..num_even {
-        let x = i * s2;
-        if x < w {
-            row[x] = b_coeffs[i];
+        // Gather column data
+        for y in 0..work_h {
+            col_vec[y] = buf[y * full_w + col];
         }
-    }
 
-    // Now, update the odd-indexed positions using the new `b` coefficients.
-    // The C code uses different formulas at the start, middle, and end of the row.
+        // Re-usable detail buffer (predict output).
+        let mut detail = vec![0i32; work_h];
 
-    // Generic updates for the main part of the row.
-    // An update at `x_update = (i * 2s) - 3s` requires `b` coeffs from `i-3` to `i`.
-    for i in 3..num_even {
-        // Check for underflow before subtracting s3
-        if i * s2 >= s3 {
-            let x_update = (i * s2) - s3;
-            if x_update < w {
-                let b0 = b_coeffs[i - 3] as i32;
-                let b1 = b_coeffs[i - 2] as i32;
-                let b2 = b_coeffs[i - 1] as i32;
-                let b3 = b_coeffs[i] as i32;
+        let s = scale;  // current scale
+        let dbl = s * 2; // stride between low-pass samples
 
-                let b_sum_12 = b1 + b2;
-                let b_sum_03 = b0 + b3;
-                // The interpolation formula from the C code's generic case.
-                let update_val = (((b_sum_12 * 9) - b_sum_03 + 8) >> 4);
-                row[x_update] = sat16(row[x_update] as i32 + update_val);
+        /* ---------- PREDICT (1-Δ) ---------- */
+        let mut y = s;
+        let simd_step = dbl * LANES; // each SIMD lane processes an odd sample
+
+        // SIMD core
+        while y + simd_step <= work_h {
+            let mut centre = [0i32; LANES];
+            let mut above  = [0i32; LANES];
+            let mut below  = [0i32; LANES];
+
+            for lane in 0..LANES {
+                let yi = y + lane * dbl;
+                centre[lane] = col_vec[yi];
+                above[lane]  = col_vec[mirror(yi as isize - s as isize, work_h)];
+                below[lane]  = col_vec[mirror(yi as isize + s as isize, work_h)];
             }
-        }
-    }
 
-    // Boundary updates at the start and end of the row, which use a simplified formula.
-    // This logic corresponds to the special-case loops in the C implementation.
-    let simplified_update = |b1, b2| (((b1 as i32 + b2 as i32 + 1) >> 1));
+            let c = Simd::<i32, LANES>::from_array(centre);
+            let a = Simd::<i32, LANES>::from_array(above);
+            let b = Simd::<i32, LANES>::from_array(below);
 
-    // Update for position `s` (corresponds to `q` at `4s` in C, so `i=2`).
-    if 2 < num_even {
-        let x_update = s;
-        if x_update < w {
-            let b1 = b_coeffs[0]; // from x=0
-            let b2 = b_coeffs[1]; // from x=2s
-            row[x_update] = sat16(row[x_update] as i32 + simplified_update(b1, b2));
-        }
-    }
-    
-    // Trailing updates for odd positions near the end of the row.
-    // This corresponds to the `while (q - s3 < e)` loop in the C code.
-    for i in num_even..(num_even + 2) {
-        // Check for underflow before subtracting s3
-        if i * s2 >= s3 {
-            let x_update = (i * s2) - s3;
-            if x_update < w {
-                // These `b` values are conceptually outside the main `b_coeffs` array.
-                // We get as many as are available and assume the rest are zero.
-                // Check for underflow before subtracting
-                let b1 = if i >= 2 { b_coeffs.get(i - 2).copied().unwrap_or(0) } else { 0 };
-                let b2 = if i >= 1 { b_coeffs.get(i - 1).copied().unwrap_or(0) } else { 0 };
-                row[x_update] = sat16(row[x_update] as i32 + simplified_update(b1, b2));
+            let pred = (a + b) >> Simd::splat(1); // floor((a+b)/2)
+            let det = c - pred;
+
+            for lane in 0..LANES {
+                detail[y + lane * dbl] = det[lane];
             }
+            y += simd_step;
+        }
+
+        // Scalar tail / boundaries
+        while y < work_h {
+            let ya = mirror(y as isize - s as isize, work_h);
+            let yb = mirror(y as isize + s as isize, work_h);
+            let pred = (col_vec[ya] + col_vec[yb]) >> 1; // floor division
+            detail[y] = col_vec[y] - pred;
+            y += dbl;
+        }
+
+        // ---- UPDATE STEP ----
+        let mut k = 0;
+        while k < work_h {
+            let left_idx = mirror(k as isize - s as isize, work_h);
+            let right_idx = mirror(k as isize + s as isize, work_h);
+            let left_detail = detail[left_idx];
+            let right_detail = detail[right_idx];
+            
+            let sum = left_detail + right_detail;
+            let update = sum >> 1;
+            
+            col_vec[k] += update;
+            k += dbl;
+        }
+
+        /* ---------- COPY DETAIL BACK ---------- */
+        let mut y_copy = s;
+        while y_copy < work_h {
+            col_vec[y_copy] = detail[y_copy];
+            y_copy += dbl;
+        }
+
+        // Scatter column data back
+        for y_scatter in 0..work_h {
+            buf[y_scatter * full_w + col] = col_vec[y_scatter];
         }
     }
 }
 
-pub struct Decode;
+/// In-place *horizontal* pass for **one** decomposition level.
+///
+/// * `buf`   – image plane, row-major, mutable so we can overwrite in place.
+/// * `full_w` – full image width (for row addressing).
+/// * `work_w/work_h` – working rectangle dimensions to process.
+/// * `scale` – current scale (1 << level).
+///
+/// Processes only the current level at the given scale.
+pub fn fwt_horizontal_inplace_single_level<const LANES: usize>(
+    buf: &mut [i32],
+    full_w: usize,
+    work_w: usize,
+    work_h: usize,
+    scale: usize,
+) where
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    // No-op when width too small
+    if work_w <= scale { return; }
+    assert!(buf.len() >= work_h * full_w, "buffer must be at least work_h * full_w pixels");
 
-impl Decode {
-    /// Backward wavelet transform using the lifting scheme.
-    /// This is a placeholder and needs to be properly implemented.
-    pub fn backward(p: &mut [i16], w: usize, h: usize, rowsize: usize, begin: usize, end: usize) {
-        // TODO: Implement the inverse wavelet transform
-        // For now, it does nothing to allow compilation.
-        let _ = (p, w, h, rowsize, begin, end);
+    let s = scale;
+    let dbl = s * 2;
+
+    for row in 0..work_h {
+        let row_start = row * full_w;
+        let row_slice = &mut buf[row_start..row_start + work_w];
+        let mut detail = vec![0i32; work_w];
+
+        // PREDICT step: compute detail coefficients
+        let mut k = s;
+        while k < work_w {
+            let c = row_slice[k];
+            let k0 = k as isize;
+            let c_m3 = if k0 >= 3 * (s as isize) { row_slice[((k0 - 3 * (s as isize)) as usize)] } else { 0 };
+            let c_m1 = if k0 >= (s as isize) { row_slice[((k0 - (s as isize)) as usize)] } else { 0 };
+            let c_p1 = if (k0 + (s as isize)) < (work_w as isize) { row_slice[((k0 + (s as isize)) as usize)] } else { 0 };
+            let c_p3 = if (k0 + 3 * (s as isize)) < (work_w as isize) { row_slice[((k0 + 3 * (s as isize)) as usize)] } else { 0 };
+            let pred = (-c_m3 + 9 * c_m1 + 9 * c_p1 - c_p3) >> 4;
+            detail[k] = c - pred;
+            k += dbl;
+        }
+
+        // UPDATE step: adjust approximation coefficients
+        let mut k = 0;
+        while k < work_w {
+            let k0 = k as isize;
+            let d_m3 = if k0 >= 3 * (s as isize) { detail[((k0 - 3 * (s as isize)) as usize)] } else { 0 };
+            let d_m1 = if k0 >= (s as isize) { detail[((k0 - (s as isize)) as usize)] } else { 0 };
+            let d_p1 = if (k0 + (s as isize)) < (work_w as isize) { detail[((k0 + (s as isize)) as usize)] } else { 0 };
+            let d_p3 = if (k0 + 3 * (s as isize)) < (work_w as isize) { detail[((k0 + 3 * (s as isize)) as usize)] } else { 0 };
+            let update = (-d_m3 + 9 * d_m1 + 9 * d_p1 - d_p3) >> 4;
+            row_slice[k] += update;
+            k += dbl;
+        }
+
+        // WRITE detail coefficients back
+        let mut k = s;
+        while k < work_w {
+            row_slice[k] = detail[k];
+            k += dbl;
+        }
     }
 }

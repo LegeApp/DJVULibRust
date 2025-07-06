@@ -115,7 +115,21 @@ pub fn rgb_to_ycbcr_buffers(
     let mut cb_samples = Vec::new();
     let mut cr_samples = Vec::new();
 
+    // Track min/max values and uniqueness for solid color detection
+    let mut y_min = i8::MAX;
+    let mut y_max = i8::MIN;
+    let mut cb_min = i8::MAX;
+    let mut cb_max = i8::MIN;
+    let mut cr_min = i8::MAX;
+    let mut cr_max = i8::MIN;
+    let mut unique_colors = std::collections::HashSet::new();
+
     for (i, &[r, g, b]) in pixels.iter().enumerate() {
+        // Track unique RGB values
+        if unique_colors.len() < 10 {  // Only track first 10 unique colors
+            unique_colors.insert((r, g, b));
+        }
+
         // Y: full 0-255 range, no centering
         let y = y_table[0][r as usize] + y_table[1][g as usize] + y_table[2][b as usize];
         let y_val = y.clamp(0, 255);
@@ -134,12 +148,39 @@ pub fn rgb_to_ycbcr_buffers(
         out_cb[i] = cb_raw.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
         out_cr[i] = cr_raw.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
         
+        // Track min/max for debug
+        y_min = y_min.min(out_y[i]);
+        y_max = y_max.max(out_y[i]);
+        cb_min = cb_min.min(out_cb[i]);
+        cb_max = cb_max.max(out_cb[i]);
+        cr_min = cr_min.min(out_cr[i]);
+        cr_max = cr_max.max(out_cr[i]);
+        
         // Collect samples for debugging
         if sample_indices.contains(&i) {
             y_samples.push((r, g, b, y_val, out_y[i]));
             cb_samples.push(out_cb[i]);
             cr_samples.push(out_cr[i]);
         }
+    }
+
+    // Debug output for color conversion
+    println!("DEBUG RGB→YCbCr conversion:");
+    println!("  Unique RGB colors: {:?}", unique_colors);
+    println!("  Y range: {} to {} (span: {})", y_min, y_max, y_max as i32 - y_min as i32);
+    println!("  Cb range: {} to {} (span: {})", cb_min, cb_max, cb_max as i32 - cb_min as i32);
+    println!("  Cr range: {} to {} (span: {})", cr_min, cr_max, cr_max as i32 - cr_min as i32);
+    println!("  Sample Y conversions: {:?}", y_samples);
+    println!("  Sample Cb values: {:?}", cb_samples);
+    println!("  Sample Cr values: {:?}", cr_samples);
+    
+    // Flag potential solid color
+    let is_likely_solid = unique_colors.len() == 1 || 
+                         (y_max as i32 - y_min as i32 <= 2 && 
+                          cb_max as i32 - cb_min as i32 <= 2 && 
+                          cr_max as i32 - cr_min as i32 <= 2);
+    if is_likely_solid {
+        println!("  *** SOLID COLOR DETECTED - should compress very well! ***");
     }
 }
 pub struct IWEncoder {

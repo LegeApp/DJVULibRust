@@ -1,7 +1,7 @@
 // src/encode/iw44/codec.rs
 
 use crate::encode::iw44::coeff_map::{CoeffMap, Block};
-use crate::encode::iw44::constants::{BAND_BUCKETS, IW_QUANT};
+use crate::encode::iw44::constants::{BAND_BUCKETS, IW_QUANT, IW_SHIFT};
 use crate::encode::zc::ZEncoder;
 use crate::Result;
 use std::io::Write;
@@ -47,13 +47,16 @@ impl Codec {
         };
 
         // Initialize quantization thresholds from IW_QUANT
+        // SCALE QUANTIZATION THRESHOLDS BY IW_SHIFT
+        let shift = IW_SHIFT as i32;  // IW_SHIFT = 6
+        let scale = 1 << shift;       // Scale factor = 64
+        
         // quant_lo corresponds to step size table indices 0-15 (Table 3 in DjVu spec)
         // quant_hi corresponds to bands 1-9 (indices 7-15 in step size table)
-        codec.quant_lo = IW_QUANT;  // Direct copy of all 16 step sizes
+        codec.quant_lo = IW_QUANT.map(|q| q * scale);  // Scale all thresholds
         
-        // For high-frequency bands, use the appropriate step sizes
-        // Band 0 uses IW_QUANT[0], bands 1-9 use indices 7-15
-        codec.quant_hi[0] = IW_QUANT[0];  // Band 0 -> step size index 0
+        // For high-frequency bands, use scaled step sizes
+        codec.quant_hi[0] = IW_QUANT[0] * scale;  // Band 0 -> step size index 0
         for j in 1..10 {
             let step_size_idx = match j {
                 1 => 7,   // Band 1 -> step size index 7
@@ -67,8 +70,15 @@ impl Codec {
                 9 => 15,  // Band 9 -> step size index 15
                 _ => 15,  // Fallback
             };
-            codec.quant_hi[j] = IW_QUANT[step_size_idx];
+            codec.quant_hi[j] = IW_QUANT[step_size_idx] * scale;
         }
+
+        // Debug quantization thresholds
+        println!("DEBUG Codec quantization thresholds (scaled by IW_SHIFT={}):", IW_SHIFT);
+        println!("  Scale factor: {}", scale);
+        println!("  quant_lo (band 0): {:?}", codec.quant_lo);
+        println!("  quant_hi (bands 1-9): {:?}", codec.quant_hi);
+        println!("  Starting at bit-plane: {}", codec.cur_bit);
 
         codec
     }
@@ -82,9 +92,50 @@ impl Codec {
         // Check if this slice contains any significant data
         let is_null = self.is_null_slice(self.cur_bit as usize, self.cur_band);
         
+        // Debug current encoding state
+        let threshold = if self.cur_band == 0 {
+            self.quant_lo[0] >> self.cur_bit
+        } else {
+            self.quant_hi[self.cur_band] >> self.cur_bit
+        };
+        
+        println!("DEBUG Encode slice: band={}, bit={}, threshold={}, is_null={}", 
+                 self.cur_band, self.cur_bit, threshold, is_null);
+        
         if !is_null {
+            // Count active coefficients for debugging
+            let mut active_coeffs = 0;
+            let mut encoded_bits = 0;
+            
             for blockno in 0..self.map.num_blocks {
                 let bucket_info = BAND_BUCKETS[self.cur_band];
+                
+                // Debug first block's coefficient distribution
+                if blockno == 0 {
+                    let input_block = &self.map.blocks[blockno];
+                    let mut coeff_count = 0;
+                    let mut max_coeff = 0i16;
+                    
+                    for bucket_idx in bucket_info.start..(bucket_info.start + bucket_info.size) {
+                        if let Some(bucket) = input_block.get_bucket(bucket_idx as u8) {
+                            for &coeff in bucket {
+                                if coeff != 0 {
+                                    coeff_count += 1;
+                                    // Use safe abs to handle overflow of i16::MIN
+                                    let abs_coeff = if coeff == i16::MIN {
+                                        32767i16 // Clamp to max positive i16
+                                    } else {
+                                        coeff.abs()
+                                    };
+                                    max_coeff = max_coeff.max(abs_coeff);
+                                }
+                            }
+                        }
+                    }
+                    if blockno == 0 {
+                        println!("  Block 0: {} non-zero coeffs, max magnitude: {}", coeff_count, max_coeff);
+                    }
+                }
                 
                 // Extract the blocks we need to avoid borrowing issues
                 let input_block = &self.map.blocks[blockno];
@@ -280,7 +331,12 @@ impl Codec {
                     }
                     
                     let sign = if prev_val < 0 { -1i16 } else { 1i16 };
-                    let abs_val = prev_val.abs() as u16;
+                    // Use safe abs to handle overflow of i16::MIN
+                    let abs_val = if prev_val == i16::MIN {
+                        32767u16 // Clamp to max positive value that fits in u16
+                    } else {
+                        prev_val.abs() as u16
+                    };
                     let new_abs = abs_val | ((bit_val as u16) << bit);
                     ecoeffs[i] = sign * (new_abs as i16);
                 }

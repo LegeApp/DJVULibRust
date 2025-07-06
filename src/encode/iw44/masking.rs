@@ -135,19 +135,20 @@ pub fn forward_mask(
             smask[y * w + x] = mask[y * mskrowsize + x];
         }
     }
-    // 2) scratch buffer for single-level decomposition
-    let mut scratch = vec![0i16; w * h];
+    // 2) scratch buffer for single-level decomposition (now i32)
+    let mut scratch = vec![0i32; w * h];
 
     let mut scale = begin.next_power_of_two();
     while scale < end {
         // copy every scale-th sample into scratch
         for y in (0..h).step_by(scale) {
             for x in (0..w).step_by(scale) {
-                scratch[y * w + x] = data[y * rowsize + x];
+                scratch[y * w + x] = data[y * rowsize + x] as i32;
             }
         }
-        // full-band forward transform
-        Encode::forward(&mut scratch, w, h, w, scale, scale * 2);
+        // full-band forward transform - use new API
+        let levels = ((scale * 2).trailing_zeros() as usize).saturating_sub(1).min(5);
+        Encode::forward::<4>(&mut scratch, w, h, levels);
 
         // zero out masked detail coefficients
         for y in (0..h).step_by(scale * 2) {
@@ -174,18 +175,18 @@ pub fn forward_mask(
         for y in (0..h).step_by(scale) {
             for x in (0..w).step_by(scale) {
                 if smask[y * w + x] == 0 {
-                    scratch[y * w + x] = data[y * rowsize + x];
+                    scratch[y * w + x] = data[y * rowsize + x] as i32;
                 }
             }
         }
 
         // re-decompose to freeze the mask out
-        Encode::forward(&mut scratch, w, h, w, scale, scale * 2);
+        Encode::forward::<4>(&mut scratch, w, h, levels);
 
         // copy the frozen coefficients back into data
         for y in (0..h).step_by(scale) {
             for x in (0..w).step_by(scale) {
-                data[y * rowsize + x] = scratch[y * w + x];
+                data[y * rowsize + x] = scratch[y * w + x].clamp(-32768, 32767) as i16;
             }
         }
 
