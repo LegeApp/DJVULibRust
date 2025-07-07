@@ -1,9 +1,6 @@
 // src/encode/iw44/encoder.rs
 
-#[cfg(not(feature = "ffi_codec"))]
 use super::codec::Codec;
-#[cfg(feature = "ffi_codec")]
-use super::ffi_codec::FfiCodec as Codec;
 use super::coeff_map::CoeffMap;
 use crate::encode::zc::ZEncoder;
 use ::image::{GrayImage, RgbImage};
@@ -160,6 +157,13 @@ pub fn ycbcr_from_rgb(img: &RgbImage) -> (Vec<i8>, Vec<i8>, Vec<i8>) {
 
     // Re-use your core converter
     rgb_to_ycbcr_planes(img.as_raw(), &mut y_buf, &mut cb_buf, &mut cr_buf);
+    
+    // DEBUG PRINT 1: After RGB to YCbCr Conversion
+    println!("DEBUG: YCbCr for {}x{} image (first 3 pixels):", w, h);
+    println!("  Y: {:?}", &y_buf[0..3.min(npix)]);
+    println!("  Cb: {:?}", &cb_buf[0..3.min(npix)]);
+    println!("  Cr: {:?}", &cr_buf[0..3.min(npix)]);
+    
     (y_buf, cb_buf, cr_buf)
 }
 
@@ -180,13 +184,49 @@ pub fn make_ycbcr_codecs(
     // Decide whether to build Cb/Cr
     let (cb_codec, cr_codec) = match params.crcb_mode {
         CrcbMode::None => (None, None),
-        CrcbMode::Half | CrcbMode::Normal | CrcbMode::Full => {
-            let mut cbmap = CoeffMap::create_from_signed_channel(cb_buf, width, height, mask, "Cb");
-            let mut crmap = CoeffMap::create_from_signed_channel(cr_buf, width, height, mask, "Cr");
-            if matches!(params.crcb_mode, CrcbMode::Half) {
-                cbmap.slash_res(2);
-                crmap.slash_res(2);
+        CrcbMode::Half => {
+            // CORRECTED: For half mode, subsample the chroma buffers BEFORE creating coefficient maps
+            let (half_width, half_height) = ((width + 1) / 2, (height + 1) / 2);
+            let half_size = (half_width * half_height) as usize;
+            
+            // Create subsampled buffers by averaging 2x2 blocks
+            let mut cb_half = vec![0i8; half_size];
+            let mut cr_half = vec![0i8; half_size];
+            
+            for y in 0..half_height {
+                for x in 0..half_width {
+                    let dst_idx = (y * half_width + x) as usize;
+                    
+                    // Average up to 4 source pixels (2x2 block)
+                    let mut cb_sum = 0i32;
+                    let mut cr_sum = 0i32;
+                    let mut count = 0;
+                    
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let src_x = x * 2 + dx;
+                            let src_y = y * 2 + dy;
+                            if src_x < width && src_y < height {
+                                let src_idx = (src_y * width + src_x) as usize;
+                                cb_sum += cb_buf[src_idx] as i32;
+                                cr_sum += cr_buf[src_idx] as i32;
+                                count += 1;
+                            }
+                        }
+                    }
+                    
+                    cb_half[dst_idx] = (cb_sum / count) as i8;
+                    cr_half[dst_idx] = (cr_sum / count) as i8;
+                }
             }
+            
+            let cbmap = CoeffMap::create_from_signed_channel(&cb_half, half_width, half_height, None, "Cb");
+            let crmap = CoeffMap::create_from_signed_channel(&cr_half, half_width, half_height, None, "Cr");
+            (Some(Codec::new(cbmap, params)), Some(Codec::new(crmap, params)))
+        },
+        CrcbMode::Normal | CrcbMode::Full => {
+            let cbmap = CoeffMap::create_from_signed_channel(cb_buf, width, height, mask, "Cb");
+            let crmap = CoeffMap::create_from_signed_channel(cr_buf, width, height, mask, "Cr");
             (Some(Codec::new(cbmap, params)), Some(Codec::new(crmap, params)))
         }
     };
@@ -296,6 +336,11 @@ impl IWEncoder {
         let mut slices_encoded = 0;
         let _initial_bytes = self.total_bytes;
         
+        // Track if any component contributed data to this chunk
+        let mut chunk_y_has_data = false;
+        let mut chunk_cb_has_data = false;
+        let mut chunk_cr_has_data = false;
+        
         // Encode slices according to DjVu spec: multiple slices per chunk
         // Each "slice" is one logical unit containing color bands for active components
         // Each codec maintains its own cur_bit and progresses independently
@@ -316,15 +361,13 @@ impl IWEncoder {
             // A DjVu "slice" contains one color band for each active component
             // Encode Y component if it still has data
             let y_has_data = if self.y_codec.cur_bit >= 0 {
-                println!("PRINTLN: About to call Y codec encode_slice, cur_bit={}", self.y_codec.cur_bit);
                 debug!("Calling Y codec encode_slice, cur_bit={}", self.y_codec.cur_bit);
-                let result = self.y_codec.encode_slice(&mut zp)?;
-                println!("PRINTLN: Y codec encode_slice returned: {}", result);
-                result
+                self.y_codec.encode_slice(&mut zp)?
             } else {
                 debug!("Y codec finished (cur_bit < 0)");
                 false
             };
+            if y_has_data { chunk_y_has_data = true; }
             
             // CORRECTED: Unconditionally encode Cb and Cr if the codecs exist and are active.
             // The faulty delay logic has been removed.
@@ -334,6 +377,7 @@ impl IWEncoder {
                     cb_has_data = cb.encode_slice(&mut zp)?;
                 }
             }
+            if cb_has_data { chunk_cb_has_data = true; }
             
             let mut cr_has_data = false;
             if let Some(ref mut cr) = &mut self.cr_codec {
@@ -341,15 +385,23 @@ impl IWEncoder {
                     cr_has_data = cr.encode_slice(&mut zp)?;
                 }
             }
+            if cr_has_data { chunk_cr_has_data = true; }
             
-            // Only count this as a slice if we encoded meaningful data from ANY component
-            if y_has_data || cb_has_data || cr_has_data {
-                slices_encoded += 1;
-                self.total_slices += 1;
-            } else {
-                // No meaningful data encoded from any component in this iteration
-                // This can happen when all codecs have progressed past their useful bit-planes
-                break;
+            // Each loop iteration corresponds to one logical slice even if it
+            // produced no output bytes.  The DjVu specification progresses the
+            // band/bit-plane state for every slice, regardless of whether any
+            // coefficients were actually encoded.  Breaking early when a slice
+            // contains no data prevents later bit-planes from ever being
+            // encoded, which caused missing chroma information.  Therefore we
+            // always advance the slice counters.
+            slices_encoded += 1;
+            self.total_slices += 1;
+
+            // If none of the components produced data we simply continue to
+            // the next slice.  The codec state was already advanced inside each
+            // `encode_slice` call.
+            if !y_has_data && !cb_has_data && !cr_has_data {
+                continue;
             }
         }
         
@@ -373,7 +425,7 @@ impl IWEncoder {
         if self.serial == 0 {
             // Major version and color type (1 byte)
             let is_color = self.cb_codec.is_some();
-            let color_bit = if is_color { 0 } else { 1 }; // 0 = color (3 components), 1 = grayscale (1 component)
+            let color_bit = if is_color { 1 } else { 0 }; // 1 = color, 0 = grayscale
             let major = (color_bit << 7) | 1; // Version 1
             chunk_data.push(major);
             
@@ -392,6 +444,11 @@ impl IWEncoder {
 
         // Append the ZP-encoded slice data
         chunk_data.extend_from_slice(&zp_data);
+
+        // DEBUG PRINT 5: After Chunk Encoding  
+        println!("DEBUG: Chunk {}: {} slices, {} bytes (Y_data={}, Cb_data={}, Cr_data={})", 
+                 self.serial, slices_encoded, chunk_data.len(), 
+                 chunk_y_has_data, chunk_cb_has_data, chunk_cr_has_data);
 
         // Update state
         self.serial = self.serial.wrapping_add(1);

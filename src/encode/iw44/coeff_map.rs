@@ -139,6 +139,10 @@ impl CoeffMap {
         // Apply the actual wavelet transform to convert pixels to coefficients
         let levels = ((map.bw.min(map.bh) as f32).log2() as usize).min(5);
         Encode::forward::<4>(&mut data32, map.bw, map.bh, levels);
+        
+        // DEBUG PRINT 2: After Wavelet Transform
+        println!("DEBUG: After wavelet transform for channel ({}x{}):", width, height);
+        println!("  First 16 coefficients: {:?}", &data32[0..16.min(data32.len())]);
 
         // Apply masking logic if mask is provided
         if let Some(mask_img) = mask {

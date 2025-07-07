@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::encode::iw44::encoder::{rgb_to_ycbcr_planes, ycbcr_from_rgb, EncoderParams, CrcbMode};
-    use image::{RgbImage, ImageBuffer, Rgb, Luma};
+    use image::{RgbImage, ImageBuffer, Rgb};
 
     /// Test color conversion with known values
     #[test]
@@ -14,14 +14,14 @@ mod tests {
 
         rgb_to_ycbcr_planes(&red_rgb, &mut y, &mut cb, &mut cr);
 
-        // Expected values for pure red using ITU-R BT.601 conversion
-        // Y = 0.299*255 + 0.587*0 + 0.114*0 = 76.245 -> 76 - 128 = -52
-        // Cb = -0.168736*255 - 0.331264*0 + 0.5*0 = -43.028 -> -43
-        // Cr = 0.5*255 - 0.418688*0 - 0.081312*0 = 127.5 -> 127
+        // Expected values for pure red using DjVu coefficients
+        // Y = 0.304348*255 + 0.608696*0 + 0.086956*0 = 77.609 -> 78 - 128 = -50
+        // Cb = -0.173913*255 - 0.347826*0 + 0.521739*0 = -44.348 -> -44
+        // Cr = 0.463768*255 - 0.405797*0 - 0.057971*0 = 118.261 -> 118
         
-        assert_eq!(y[0], -52, "Y component for pure red");
-        assert_eq!(cb[0], -43, "Cb component for pure red");
-        assert_eq!(cr[0], 127, "Cr component for pure red");
+        assert_eq!(y[0], -50, "Y component for pure red");
+        assert_eq!(cb[0], -44, "Cb component for pure red");
+        assert_eq!(cr[0], 118, "Cr component for pure red");
     }
 
     #[test]
@@ -34,14 +34,14 @@ mod tests {
 
         rgb_to_ycbcr_planes(&green_rgb, &mut y, &mut cb, &mut cr);
 
-        // Expected values for pure green
-        // Y = 0.299*0 + 0.587*255 + 0.114*0 = 149.685 -> 150 - 128 = 22
-        // Cb = -0.168736*0 - 0.331264*255 + 0.5*0 = -84.472 -> -84
-        // Cr = 0.5*0 - 0.418688*255 - 0.081312*0 = -106.765 -> -107
+        // Expected values for pure green using DjVu coefficients
+        // Y = 0.304348*0 + 0.608696*255 + 0.086956*0 = 155.218 -> 155 - 128 = 27
+        // Cb = -0.173913*0 - 0.347826*255 + 0.521739*0 = -88.696 -> -89
+        // Cr = 0.463768*0 - 0.405797*255 - 0.057971*0 = -103.478 -> -103
         
-        assert_eq!(y[0], 22, "Y component for pure green");
-        assert_eq!(cb[0], -84, "Cb component for pure green");
-        assert_eq!(cr[0], -107, "Cr component for pure green");
+        assert_eq!(y[0], 27, "Y component for pure green");
+        assert_eq!(cb[0], -89, "Cb component for pure green");
+        assert_eq!(cr[0], -103, "Cr component for pure green");
     }
 
     #[test]
@@ -54,14 +54,14 @@ mod tests {
 
         rgb_to_ycbcr_planes(&blue_rgb, &mut y, &mut cb, &mut cr);
 
-        // Expected values for pure blue
-        // Y = 0.299*0 + 0.587*0 + 0.114*255 = 29.07 -> 29 - 128 = -99
-        // Cb = -0.168736*0 - 0.331264*0 + 0.5*255 = 127.5 -> 127
-        // Cr = 0.5*0 - 0.418688*0 - 0.081312*255 = -20.735 -> -21
+        // Expected values for pure blue using DjVu coefficients
+        // Y = 0.304348*0 + 0.608696*0 + 0.086956*255 = 22.174 -> 22 - 128 = -106
+        // Cb = -0.173913*0 - 0.347826*0 + 0.521739*255 = 133.043 -> 127 (clamped)
+        // Cr = 0.463768*0 - 0.405797*0 - 0.057971*255 = -14.783 -> -15
         
-        assert_eq!(y[0], -99, "Y component for pure blue");
+        assert_eq!(y[0], -106, "Y component for pure blue");
         assert_eq!(cb[0], 127, "Cb component for pure blue");
-        assert_eq!(cr[0], -21, "Cr component for pure blue");
+        assert_eq!(cr[0], -15, "Cr component for pure blue");
     }
 
     #[test]
@@ -121,19 +121,19 @@ mod tests {
         assert_eq!(cr_buf.len(), 4);
 
         // Check red pixel
-        assert_eq!(y_buf[0], -52);
-        assert_eq!(cb_buf[0], -43);
-        assert_eq!(cr_buf[0], 127);
+        assert_eq!(y_buf[0], -50);
+        assert_eq!(cb_buf[0], -44);
+        assert_eq!(cr_buf[0], 118);
 
         // Check green pixel
-        assert_eq!(y_buf[1], 22);
-        assert_eq!(cb_buf[1], -84);
-        assert_eq!(cr_buf[1], -107);
+        assert_eq!(y_buf[1], 27);
+        assert_eq!(cb_buf[1], -89);
+        assert_eq!(cr_buf[1], -103);
 
         // Check blue pixel
-        assert_eq!(y_buf[2], -99);
+        assert_eq!(y_buf[2], -106);
         assert_eq!(cb_buf[2], 127);
-        assert_eq!(cr_buf[2], -21);
+        assert_eq!(cr_buf[2], -15);
 
         // Check white pixel
         assert_eq!(y_buf[3], 127);

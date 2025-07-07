@@ -87,7 +87,7 @@ impl Codec {
             ctx_root: 0,
         };
 
-        // Initialize quantization thresholds from IW_QUANT
+        // Initialize quantization thresholds from IW_QUANT with quality scaling
         // Apply quality scaling based on params.decibels
         let quality_scale = if let Some(db) = params.decibels {
             // Convert decibels to quality scale factor (similar to JPEG quality)
@@ -98,36 +98,33 @@ impl Codec {
             1.0 // Default scaling
         };
         
-        // Initialize quantization thresholds directly from IW_QUANT.
-        // The wavelet coefficients are scaled by `IW_SHIFT` during the transform,
-        // therefore the step sizes from the specification must *not* be shifted
-        // here.  Using the original values ensures that the significance tests
-        // and reconstruction levels match the DjVu reference encoder.
+        // CORRECTED: Apply quality scaling to ALL quantization thresholds
+        // Initialize both quant_lo and quant_hi with the same scaled values
         for i in 0..16 {
-            codec.quant_lo[i] = IW_QUANT[i];
+            let step = (IW_QUANT[i] as f32 * quality_scale).max(1.0);
+            codec.quant_lo[i] = step as i32;
         }
 
-        codec.quant_hi[0] = codec.quant_lo[0]; // Band 0 uses quant_lo
-        for j in 1..10 {
-            let step_size_idx = j.min(15); // Bands 1-9 use indices 1-9, clamped to 15
-            codec.quant_hi[j] = IW_QUANT[step_size_idx];
+        for j in 0..10 {
+            let step_size_idx = j.min(15); // Bands 0-9 use indices 0-9, clamped to 15
+            let step = (IW_QUANT[step_size_idx] as f32 * quality_scale).max(1.0);
+            codec.quant_hi[j] = step as i32;
         }
 
         // Start from the highest bit-plane that contains information
-        // For a solid color image, we need to be much more conservative
-        // Different channels may need different starting bit-planes based on coefficient magnitude
+        // Recompute based on the scaled step size, not the raw coefficient peak
         codec.cur_bit = if max_coeff > 0 {
-            // For very small coefficients (like Cr channel with value 21), we need an even higher bit-plane
-            if max_coeff < 50 {
-                12 // Very conservative for small coefficients like Cr
-            } else if max_coeff < 1000 {
-                10 // Conservative starting point for small coefficients like Y/Cb
-            } else {
-                max_coeff.ilog2() as i32
-            }
+            // Use the largest scaled quantization step size to determine starting bit-plane
+            let max_step = codec.quant_lo.iter().chain(codec.quant_hi.iter()).max().unwrap_or(&1);
+            let effective_max = (max_coeff as f32 / quality_scale).max(1.0) as i32;
+            effective_max.ilog2() as i32
         } else {
             0 // For empty images, start at bit-plane 0
         };
+
+        // DEBUG PRINT 3: During Codec Initialization
+        println!("DEBUG: Codec init: total_coeffs={}, nonzero_coeffs={}, max_coeff={}, cur_bit={}", 
+                 total_coeffs, nonzero_coeffs, max_coeff, codec.cur_bit);
 
         #[cfg(debug_assertions)]
         {
@@ -174,6 +171,9 @@ impl Codec {
             // Return false to indicate no data was encoded in this slice
             return Ok(false);
         }
+
+        // DEBUG PRINT 4: During Slice Encoding (when slice is not null)
+        println!("DEBUG: Encoding slice: band={}, bit={}", self.cur_band, self.cur_bit);
 
         debug!("Slice not null - proceeding to bucket encoding band={} bit={}", self.cur_band, self.cur_bit);
 

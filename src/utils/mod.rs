@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod log;
+pub mod color_checker;
 pub mod progress;
 pub mod write_ext;
 
