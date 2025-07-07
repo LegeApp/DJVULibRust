@@ -26,8 +26,8 @@ impl Encode {
                 } else {
                     0
                 };
-                // Center pixel value for IW44: 0..255 -> -128..127
-                data32[y * w + x] = (px as i32) - 128;
+                // Center and scale for fixed-point IW44: (0..255 -> -128..127) << IW_SHIFT
+                data32[y * w + x] = ((px as i32) - 128) << crate::encode::iw44::constants::IW_SHIFT;
             }
         }
     }
@@ -51,8 +51,8 @@ impl Encode {
                 } else {
                     0
                 };
-                // Center pixel value for IW44: 0..255 -> -128..127
-                data32[y * stride + x] = (px as i32) - 128;
+                // Center and scale for fixed-point IW44: (0..255 -> -128..127) << IW_SHIFT
+                data32[y * stride + x] = ((px as i32) - 128) << crate::encode::iw44::constants::IW_SHIFT;
             }
         }
     }
@@ -78,7 +78,8 @@ impl Encode {
                 } else {
                     0
                 };
-                data32[out_idx] = val;
+                // Scale signed i8 values for fixed-point arithmetic
+                data32[out_idx] = (val as i32) << crate::encode::iw44::constants::IW_SHIFT;
             }
         }
     }

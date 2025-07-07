@@ -8,6 +8,7 @@ use bytemuck;
 use std::io::Cursor;
 use std::sync::OnceLock;
 use thiserror::Error;
+use log::{debug, info, warn, error};
 
 #[derive(Error, Debug)]
 pub enum EncoderError {
@@ -72,8 +73,8 @@ fn get_ycc_tables() -> &'static ([[i32; 256]; 3], [[i32; 256]; 3], [[i32; 256]; 
         // From IW44EncodeCodec.cpp rgb_to_ycc[3][3] matrix:
         const RGB_TO_YCC: [[f32; 3]; 3] = [
             [ 0.304348,  0.608696,  0.086956],  // Y coefficients
-            [ 0.463768, -0.405797, -0.057971],  // Cb coefficients  
-            [-0.173913, -0.347826,  0.521739],  // Cr coefficients
+            [ 0.463768, -0.405797, -0.057971],  // Cr coefficients
+            [-0.173913, -0.347826,  0.521739],  // Cb coefficients
         ];
         
         for k in 0..256 {
@@ -82,13 +83,13 @@ fn get_ycc_tables() -> &'static ([[i32; 256]; 3], [[i32; 256]; 3], [[i32; 256]; 
             y[1][k] = (k as f32 * 65536.0 * RGB_TO_YCC[0][1]) as i32;
             y[2][k] = (k as f32 * 65536.0 * RGB_TO_YCC[0][2]) as i32;
             
-            cb[0][k] = (k as f32 * 65536.0 * RGB_TO_YCC[1][0]) as i32;
-            cb[1][k] = (k as f32 * 65536.0 * RGB_TO_YCC[1][1]) as i32;
-            cb[2][k] = (k as f32 * 65536.0 * RGB_TO_YCC[1][2]) as i32;
-            
-            cr[0][k] = (k as f32 * 65536.0 * RGB_TO_YCC[2][0]) as i32;
-            cr[1][k] = (k as f32 * 65536.0 * RGB_TO_YCC[2][1]) as i32;
-            cr[2][k] = (k as f32 * 65536.0 * RGB_TO_YCC[2][2]) as i32;
+            cb[0][k] = (k as f32 * 65536.0 * RGB_TO_YCC[2][0]) as i32;
+            cb[1][k] = (k as f32 * 65536.0 * RGB_TO_YCC[2][1]) as i32;
+            cb[2][k] = (k as f32 * 65536.0 * RGB_TO_YCC[2][2]) as i32;
+
+            cr[0][k] = (k as f32 * 65536.0 * RGB_TO_YCC[1][0]) as i32;
+            cr[1][k] = (k as f32 * 65536.0 * RGB_TO_YCC[1][1]) as i32;
+            cr[2][k] = (k as f32 * 65536.0 * RGB_TO_YCC[1][2]) as i32;
         }
         (y, cb, cr)
     })
@@ -123,10 +124,10 @@ pub fn rgb_to_ycbcr_planes(
         out_y[i] = ((y >> 16) - 128) as i8;
 
         let cb = cb_tbl[0][r] + cb_tbl[1][g] + cb_tbl[2][b] + 32768;
-        out_cb[i] = ((cb >> 16) - 128) as i8;
+        out_cb[i] = (cb >> 16).clamp(-128, 127) as i8;
 
         let cr = cr_tbl[0][r] + cr_tbl[1][g] + cr_tbl[2][b] + 32768;
-        out_cr[i] = ((cr >> 16) - 128) as i8;
+        out_cr[i] = (cr >> 16).clamp(-128, 127) as i8;
     }
 }
 
@@ -255,11 +256,18 @@ impl IWEncoder {
         mask: Option<&GrayImage>,
         params: EncoderParams,
     ) -> Result<Self, EncoderError> {
+        info!("IWEncoder::from_rgb called with image {}x{}", img.width(), img.height());
         encoder_from_rgb_with_helpers(img, mask, params)
     }
 
 
     pub fn encode_chunk(&mut self, max_slices: usize) -> Result<(Vec<u8>, bool), EncoderError> {
+        info!("encode_chunk called with max_slices={}", max_slices);
+        info!("Y codec cur_bit={}, CB codec cur_bit={:?}, CR codec cur_bit={:?}", 
+                 self.y_codec.cur_bit,
+                 self.cb_codec.as_ref().map(|c| c.cur_bit),
+                 self.cr_codec.as_ref().map(|c| c.cur_bit));
+        
         let (w, h) = {
             let map = &self.y_codec.map;
             let w = map.width();
@@ -294,15 +302,24 @@ impl IWEncoder {
                            self.cb_codec.as_ref().map_or(false, |c| c.cur_bit >= 0) ||
                            self.cr_codec.as_ref().map_or(false, |c| c.cur_bit >= 0);
             
+            debug!("Loop iteration, any_active={}, Y cur_bit={}, slices_encoded={}", 
+                     any_active, self.y_codec.cur_bit, slices_encoded);
+            
             if !any_active {
+                debug!("No codecs active, breaking loop");
                 break;
             }
             
             // A DjVu "slice" contains one color band for each active component
             // Encode Y component if it still has data
             let y_has_data = if self.y_codec.cur_bit >= 0 {
-                self.y_codec.encode_slice(&mut zp)?
+                println!("PRINTLN: About to call Y codec encode_slice, cur_bit={}", self.y_codec.cur_bit);
+                debug!("Calling Y codec encode_slice, cur_bit={}", self.y_codec.cur_bit);
+                let result = self.y_codec.encode_slice(&mut zp)?;
+                println!("PRINTLN: Y codec encode_slice returned: {}", result);
+                result
             } else {
+                debug!("Y codec finished (cur_bit < 0)");
                 false
             };
             
@@ -317,11 +334,10 @@ impl IWEncoder {
             
             if let (Some(ref mut cb), Some(ref mut cr)) = (&mut self.cb_codec, &mut self.cr_codec) {
                 if self.total_slices >= crcb_delay {
+                    // Only show debug for first few slices to avoid flooding
                     #[cfg(debug_assertions)]
-                    {
-                        eprintln!("DEBUG: Encoding Cb/Cr slices (total_slices={}, delay={})", self.total_slices, crcb_delay);
-                        eprintln!("DEBUG: Before encoding - Y cur_bit: {}, Cb cur_bit: {}, Cr cur_bit: {}", 
-                                 self.y_codec.cur_bit, cb.cur_bit, cr.cur_bit);
+                    if self.total_slices < crcb_delay + 5 {
+                        debug!("Encoding Cb/Cr slices (total_slices={}, delay={})", self.total_slices, crcb_delay);
                     }
                     
                     // Encode Cb if it still has data
@@ -335,18 +351,15 @@ impl IWEncoder {
                     }
                     
                     #[cfg(debug_assertions)]
-                    {
-                        eprintln!("DEBUG: After encoding - Y cur_bit: {}, Cb cur_bit: {}, Cr cur_bit: {}", 
-                                 self.y_codec.cur_bit, cb.cur_bit, cr.cur_bit);
-                        eprintln!("DEBUG: Y has data: {}, Cb has data: {}, Cr has data: {}", y_has_data, cb_has_data, cr_has_data);
+                    if self.total_slices < crcb_delay + 5 {
+                        debug!("Y has data: {}, Cb has data: {}, Cr has data: {}", y_has_data, cb_has_data, cr_has_data);
                     }
                 } else {
                     #[cfg(debug_assertions)]
-                    eprintln!("DEBUG: Skipping Cb/Cr due to delay (total_slices={} < delay={})", self.total_slices, crcb_delay);
+                    if self.total_slices < 5 {
+                        debug!("Skipping Cb/Cr due to delay (total_slices={} < delay={})", self.total_slices, crcb_delay);
+                    }
                 }
-            } else {
-                #[cfg(debug_assertions)]
-                eprintln!("DEBUG: No Cb/Cr codecs available");
             }
             
             // Only count this as a slice if we encoded meaningful data from ANY component
@@ -409,7 +422,7 @@ impl IWEncoder {
         self.total_bytes += chunk_data.len();
 
         #[cfg(debug_assertions)]
-        eprintln!("DEBUG: Writing IW44 chunk {}, {} slices, {} bytes", 
+        debug!("Writing IW44 chunk {}, {} slices, {} bytes", 
                  self.serial - 1, slices_encoded, chunk_data.len());
         
         // Determine if there are more slices to emit

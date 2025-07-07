@@ -357,21 +357,20 @@ impl PageComponents {
         // BG44 [9976] IW4 data #4, 9 slices
         
         let mut chunk_count = 0;
-        
-        // Progressive slice grouping strategy:
-        // - First chunk: Many slices (high-frequency data)
-        // - Subsequent chunks: Fewer slices each time
-        let slice_grouping = [50, 20, 10, 5, 5, 5]; // Decreasing slice counts per chunk
-        let mut grouping_index = 0;
-        
+
+        // Per the DjVu spec, we repeatedly call the encoder to get data chunks until it's done.
+        // The encoder signals completion by returning an empty vector.
+        // We will ask for a reasonable number of slices per chunk.
+        const SLICES_PER_CHUNK: usize = 20;
+
         loop {
-            let target_slices = slice_grouping[grouping_index.min(slice_grouping.len() - 1)];
-            let (iw44_stream, more) = encoder
-                .encode_chunk(target_slices)
+            let (iw44_stream, _more) = encoder
+                .encode_chunk(SLICES_PER_CHUNK) // We ignore the 'more' flag as it's unreliable
                 .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
 
+            // An empty stream from the encoder signifies the end of data.
             if iw44_stream.is_empty() {
-                println!("DEBUG: Encoder returned empty chunk, stopping.");
+                println!("DEBUG: Encoder returned empty chunk, signaling completion.");
                 break;
             }
 
@@ -385,13 +384,6 @@ impl PageComponents {
             writer.put_chunk(iw_chunk_id)?;
             writer.write_all(&iw44_stream)?;
             writer.close_chunk()?;
-
-            if !more {
-                break;
-            }
-            
-            // Move to next grouping size for subsequent chunks
-            grouping_index += 1;
         }
 
         Ok(())
