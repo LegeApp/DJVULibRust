@@ -2,8 +2,18 @@ use djvu_encoder::doc::{PageEncodeParams, PageComponents};
 use image::RgbImage;
 use std::fs;
 use std::process::Command;
+use tracing_subscriber;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging with INFO level to see debug output
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_file(true)
+        .with_line_number(true)
+        .init();
+    
     println!("=== Single Page DjVu Generation Test ===");
     
     // Test 1: Pure blue solid color image
