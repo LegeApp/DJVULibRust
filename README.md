@@ -5,3 +5,5 @@ DJVU Encoder only in Rust, not working, needs work in the following areas:
 - IW44 reverse transform
 - Final document creation logic
 
+  1/29/26 update, coming back to it again - JB2, arithmetic, ZP now work. IW44 is the last puzzle.
+
