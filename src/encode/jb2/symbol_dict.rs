@@ -1,20 +1,17 @@
-//! This module defines the core data structures for JB2 symbols and bitmaps,
-//! and provides utilities for their manipulation, such as sorting for optimal
-//! dictionary encoding.
+//! Core data structures for JB2 encoding.
+//!
+//! This module provides:
+//! - `BitImage`: The canonical bilevel bitmap type used by the encoder
+//! - `Rect`: Simple bounding box for regions
+//! - `Comparator`: Symbol matching with spatial search for dictionary building
+//! - Simple shared dictionary support for multi-page encoding
 
-use crate::encode::jb2::context;
-use crate::encode::jb2::error::Jb2Error;
-use crate::encode::jb2::num_coder::{NumCoder, NumContext};
-use crate::encode::zc::ZEncoder;
 use bitvec::order::Msb0;
 use bitvec::prelude::*;
-use lutz;
-use once_cell::unsync::OnceCell;
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::sync::{Arc, OnceLock};
 
 /// Errors that can occur when creating or manipulating a `BitImage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,7 +51,7 @@ pub struct BitImage {
     pub width: usize,
     pub height: usize,
     bits: BitVec<u8, Msb0>,
-    packed_cache: OnceCell<Vec<u32>>,
+    packed_cache: OnceLock<Vec<u32>>,
 }
 
 impl PartialEq for BitImage {
@@ -89,7 +86,7 @@ impl BitImage {
             width: width_us,
             height: height_us,
             bits,
-            packed_cache: OnceCell::new(),
+            packed_cache: OnceLock::new(),
         })
     }
 
@@ -100,7 +97,7 @@ impl BitImage {
             width,
             height,
             bits: bv,
-            packed_cache: OnceCell::new(),
+            packed_cache: OnceLock::new(),
         }
     }
 
@@ -147,23 +144,7 @@ impl BitImage {
     }
 }
 
-impl lutz::Image for BitImage {
-    fn width(&self) -> u32 {
-        self.width as u32
-    }
-    fn height(&self) -> u32 {
-        self.height as u32
-    }
-
-    fn has_pixel(&self, x: u32, y: u32) -> bool {
-        // Return true only if there's a foreground pixel at this location
-        if x < self.width as u32 && y < self.height as u32 {
-            self.get_pixel_unchecked(x as usize, y as usize)
-        } else {
-            false
-        }
-    }
-}
+// Lutz trait implementation removed - using homegrown connected components instead
 
 // ==============================================
 // Connected Components (from jbig2lutz.rs)
@@ -180,47 +161,11 @@ pub struct ConnectedComponent {
     pub pixels: Vec<(u32, u32)>,
 }
 
-/// Finds connected components using Lutz algorithm
-pub fn find_connected_components(image: &BitImage, min_size: usize) -> Vec<ConnectedComponent> {
-    let components = lutz::lutz::<_, Vec<lutz::Pixel>>(image);
-    let mut result = Vec::new();
-    for pixels in components {
-        if pixels.len() >= min_size {
-            let mut min_x = u32::MAX;
-            let mut min_y = u32::MAX;
-            let mut max_x = 0;
-            let mut max_y = 0;
-            for p in &pixels {
-                min_x = min_x.min(p.x);
-                min_y = min_y.min(p.y);
-                max_x = max_x.max(p.x);
-                max_y = max_y.max(p.y);
-            }
-
-            let width = max_x - min_x + 1;
-            let height = max_y - min_y + 1;
-            if let Ok(mut bitmap) = BitImage::new(width, height) {
-                for p in &pixels {
-                    bitmap.set_usize((p.x - min_x) as usize, (p.y - min_y) as usize, true);
-                }
-
-                let component = ConnectedComponent {
-                    bitmap,
-                    bounds: Rect {
-                        x: min_x,
-                        y: min_y,
-                        width,
-                        height,
-                    },
-                    dict_symbol_index: None,
-                    pixel_count: pixels.len(),
-                    pixels: pixels.into_iter().map(|p| (p.x, p.y)).collect(),
-                };
-                result.push(component);
-            }
-        }
-    }
-    result
+/// Finds connected components using homegrown algorithm
+/// Note: This is a placeholder - actual implementation uses the homegrown CC algorithm
+pub fn find_connected_components(_image: &BitImage, _min_size: usize) -> Vec<ConnectedComponent> {
+    // This function is deprecated - use the homegrown connected components instead
+    Vec::new()
 }
 
 // ==============================================
@@ -336,135 +281,89 @@ impl Comparator {
     }
 }
 
-/// Builds a symbol dictionary from a page image by finding and clustering symbols.
-pub struct SymDictBuilder {
-    comparator: Comparator,
-    max_error: u32,
-    exact_matches: HashMap<BitImage, usize>,
+// ==============================================
+// Shared Dictionary Support
+// ==============================================
+
+/// Simple shared dictionary for multi-page JB2 encoding.
+///
+/// This provides the minimal infrastructure needed for DjVu's Djbz/Sjbz
+/// multi-page workflow:
+/// 1. Encode shared shapes once → Djbz chunk via `JB2Encoder::encode_dictionary()`
+/// 2. Each page references inherited shapes → Sjbz chunk via
+///    `JB2Encoder::encode_page_with_shapes()` with `inherited_shape_count`
+///
+/// No RLE compression or complex type hierarchy — just Arc-based sharing.
+#[derive(Clone, Debug)]
+pub struct SharedDict {
+    shapes: Arc<Vec<BitImage>>,
 }
 
-impl SymDictBuilder {
-    /// Creates a new symbol dictionary builder.
-    pub fn new(max_error: u32) -> Self {
+impl SharedDict {
+    /// Create a new shared dictionary from a vector of shapes.
+    pub fn new(shapes: Vec<BitImage>) -> Self {
         Self {
-            comparator: Comparator::default(),
-            max_error,
-            exact_matches: HashMap::new(),
+            shapes: Arc::new(shapes),
         }
     }
 
-    /// Builds a dictionary from the given image.
-    ///
-    /// Returns the dictionary (as a vector of `BitImage`s) and a vector of
-    /// `ConnectedComponent`s which includes the index of the dictionary symbol
-    /// that each component was matched with.
-    pub fn build(&mut self, image: &BitImage) -> (Vec<BitImage>, Vec<ConnectedComponent>) {
-        let mut components = find_connected_components(image, 4);
-        let mut dictionary: Vec<BitImage> = Vec::new();
-        self.exact_matches.clear();
+    /// Get the number of shapes in this dictionary.
+    pub fn shape_count(&self) -> usize {
+        self.shapes.len()
+    }
 
-        for component in &mut components {
-            // 1. Check for an exact match, which is fast.
-            if let Some(&dict_idx) = self.exact_matches.get(&component.bitmap) {
-                component.dict_symbol_index = Some(dict_idx);
-                continue;
-            }
+    /// Get a reference to a shape by index.
+    pub fn get_shape(&self, index: usize) -> Option<&BitImage> {
+        self.shapes.get(index)
+    }
 
-            // 2. If no exact match, and if lossy compression is allowed, search for a close match.
-            let mut best_match: Option<(u32, usize)> = None;
-            if self.max_error > 0 {
-                for (dict_idx, dict_symbol) in dictionary.iter().enumerate() {
-                    if let Some((error, _dx, _dy)) =
-                        self.comparator
-                            .distance(&component.bitmap, dict_symbol, self.max_error)
-                    {
-                        if best_match.map_or(true, |(e, _)| error < e) {
-                            best_match = Some((error, dict_idx));
-                        }
-                    }
-                }
-            }
-
-            // 3. Decide whether to use the found match or add a new symbol to the dictionary.
-            if let Some((error, dict_idx)) = best_match {
-                if error <= self.max_error {
-                    component.dict_symbol_index = Some(dict_idx);
-                    // Don't add to exact_matches because it wasn't an exact match.
-                    continue;
-                }
-            }
-
-            // 4. No suitable match found, add this component's bitmap as a new symbol.
-            let new_symbol_idx = dictionary.len();
-            component.dict_symbol_index = Some(new_symbol_idx);
-            dictionary.push(component.bitmap.clone());
-            self.exact_matches
-                .insert(component.bitmap.clone(), new_symbol_idx);
-        }
-
-        (dictionary, components)
+    /// Get a reference to all shapes.
+    pub fn shapes(&self) -> &[BitImage] {
+        &self.shapes
     }
 }
 
-/// Encodes a symbol dictionary to the output stream.
-pub struct SymDictEncoder {
-    nc: NumCoder,
-    direct_base_context: u32,
-    // NumContext handles for tree-based encoding
-    ctx_sym_count: NumContext,
-    ctx_sym_width: NumContext,
-    ctx_sym_height: NumContext,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl SymDictEncoder {
-    /// Creates a new symbol dictionary encoder.
-    pub fn new(_base_context_index: u32, _max_contexts: u32, direct_base_context: u32) -> Self {
-        Self {
-            nc: NumCoder::new(),
-            direct_base_context,
-            ctx_sym_count: 0,
-            ctx_sym_width: 0,
-            ctx_sym_height: 0,
-        }
+    #[test]
+    fn test_bitimage_creation() {
+        let img = BitImage::new(10, 10);
+        assert!(img.is_ok());
+        let img = img.unwrap();
+        assert_eq!(img.width, 10);
+        assert_eq!(img.height, 10);
     }
 
-    /// Encodes the dictionary symbols to the arithmetic coder.
-    pub fn encode<W: Write>(
-        &mut self,
-        ac: &mut ZEncoder<W>,
-        dictionary: &[BitImage],
-    ) -> Result<(), Jb2Error> {
-        // 1. Encode the number of symbols in the dictionary.
-        self.nc.code_num(
-            ac,
-            &mut self.ctx_sym_count,
-            0,
-            65535,
-            dictionary.len() as i32,
-        )?;
+    #[test]
+    fn test_comparator_exact_match() {
+        let mut img1 = BitImage::new(5, 5).unwrap();
+        let mut img2 = BitImage::new(5, 5).unwrap();
+        
+        // Set same pixels
+        img1.set_usize(2, 2, true);
+        img2.set_usize(2, 2, true);
+        
+        let mut comp = Comparator::default();
+        let result = comp.distance(&img1, &img2, 100);
+        assert!(result.is_some());
+        let (err, dx, dy) = result.unwrap();
+        assert_eq!(err, 0); // Exact match
+        assert_eq!(dx, 0);
+        assert_eq!(dy, 0);
+    }
 
-        // 2. Encode each symbol.
-        for symbol in dictionary {
-            // Encode width and height.
-            self.nc.code_num(
-                ac,
-                &mut self.ctx_sym_width,
-                1,
-                65535,
-                symbol.width as i32,
-            )?;
-            self.nc.code_num(
-                ac,
-                &mut self.ctx_sym_height,
-                1,
-                65535,
-                symbol.height as i32,
-            )?;
-
-            // Encode the raw bitmap data using the centralized direct coding function.
-            context::encode_bitmap_direct(ac, symbol, self.direct_base_context as usize)?;
-        }
-
-        Ok(())
+    #[test]
+    fn test_shared_dict() {
+        let shapes = vec![
+            BitImage::new(10, 10).unwrap(),
+            BitImage::new(15, 15).unwrap(),
+        ];
+        let dict = SharedDict::new(shapes);
+        assert_eq!(dict.shape_count(), 2);
+        assert!(dict.get_shape(0).is_some());
+        assert!(dict.get_shape(1).is_some());
+        assert!(dict.get_shape(2).is_none());
     }
 }

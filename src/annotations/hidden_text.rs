@@ -56,9 +56,22 @@ impl Zone {
             text_len: 0,
         }
     }
+
+    /// Creates a word zone with text and bounding box
+    pub fn word(text: String, bbox: BoundingBox) -> Self {
+        Self {
+            kind: ZoneKind::Word,
+            bbox,
+            children: Vec::new(),
+            text: Some(text),
+            text_start: 0,
+            text_len: 0,
+        }
+    }
 }
 
 /// Represents the complete hidden text structure for a page.
+#[derive(Debug, Clone)]
 pub struct HiddenText {
     pub root_zone: Zone,
 }
@@ -71,13 +84,59 @@ impl HiddenText {
         }
     }
 
+    /// Creates a HiddenText layer from a list of word bounding boxes
+    /// This is a convenience method for HOCR/OCR integration
+    ///
+    /// # Arguments
+    /// * `page_width`, `page_height` - Page dimensions
+    /// * `words` - Vector of (text, x, y, width, height) tuples
+    ///
+    /// # Example
+    /// ```ignore
+    /// let hidden_text = HiddenText::from_word_boxes(
+    ///     2550, 3300,
+    ///     vec![
+    ///         ("Hello".to_string(), 100, 200, 150, 50),
+    ///         ("World".to_string(), 260, 200, 180, 50),
+    ///     ]
+    /// );
+    /// ```
+    pub fn from_word_boxes(
+        page_width: u16,
+        page_height: u16,
+        words: Vec<(String, u16, u16, u16, u16)>, // (text, x, y, w, h)
+    ) -> Self {
+        let mut root = Zone::new(
+            ZoneKind::Page,
+            BoundingBox {
+                x: 0,
+                y: 0,
+                w: page_width,
+                h: page_height,
+            },
+        );
+
+        // Simple grouping: add all words as direct children
+        // A more sophisticated implementation could group into lines/paragraphs
+        for (text, x, y, w, h) in words {
+            let word_zone = Zone::word(
+                text,
+                BoundingBox { x, y, w, h },
+            );
+            root.children.push(word_zone);
+        }
+
+        Self { root_zone: root }
+    }
+
     /// Encodes the hidden text structure into the binary format for a TXTa/TXTz chunk.
     /// The output of this function should be compressed (e.g., with bzip2) before
     /// being stored in a final DjVu file as a 'TXTz' chunk.
-    pub fn encode(&mut self, writer: &mut impl Write) -> Result<(), HiddenTextError> {
+    pub fn encode(&self, writer: &mut impl Write) -> Result<(), HiddenTextError> {
         // 1. Flatten the text from the tree into a single string
         let mut full_text = String::new();
-        HiddenText::flatten_text_recursive(&mut self.root_zone, &mut full_text);
+        let mut root_zone = self.root_zone.clone();
+        HiddenText::flatten_text_recursive(&mut root_zone, &mut full_text);
 
         // 2. Write the text component
         write_u24(writer, full_text.len() as u32)?;
@@ -86,7 +145,7 @@ impl HiddenText {
         // 3. Write the zone hierarchy
         const VERSION: u8 = 1;
         writer.write_all(&[VERSION])?;
-        self.encode_zone_recursive(writer, &self.root_zone, None, None)?;
+        self.encode_zone_recursive(writer, &root_zone, None, None)?;
 
         Ok(())
     }

@@ -17,7 +17,8 @@ use std::io::Cursor;
 /// disturbing other parts of the codebase (e.g., JB2, BZZ) which remain on Rust.
 pub trait ZpEncoderCursor {
     fn encode(&mut self, bit: bool, ctx: &mut BitContext) -> Result<(), ZCodecError>;
-    fn IWencoder(&mut self, bit: bool) -> Result<(), ZCodecError>;
+    fn iwencoder(&mut self, bit: bool) -> Result<(), ZCodecError>;
+    fn encode_raw_bit(&mut self, bit: bool) -> Result<(), ZCodecError>;
     fn tell_bytes(&self) -> usize;
     fn finish(self) -> Result<Cursor<Vec<u8>>, ZCodecError>
     where

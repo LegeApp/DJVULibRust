@@ -7,6 +7,7 @@ pub struct ZpTableEntry {
     pub dn: u8, // Next state when adapting down (LPS)
 }
 
+#[allow(unused_macros)]
 macro_rules! zp {
     ($p:expr, $m:expr, $up:expr, $dn:expr $(,)?) => {
         ZpTableEntry {

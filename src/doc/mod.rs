@@ -1,13 +1,18 @@
+// Core infrastructure
 pub mod djvu_dir;
-pub mod djvu_doceditor;
-pub mod djvu_document;
-pub mod djvu_nav;
-pub mod document_encoder;
 pub mod page_encoder;
+pub mod page_collection;
 
-// Re-export public items
-pub use djvu_dir::*;
-pub use djvu_doceditor::*;
-pub use djvu_document::*;
-pub use document_encoder::DocumentEncoder;
-pub use page_encoder::{PageComponents, PageEncodeParams};
+// Public builder API
+pub mod builder;
+
+// Private encoder implementation
+pub(crate) mod encoder;
+
+// Re-export public builder API
+pub use builder::{DjvuBuilder, DjvuDocument, ImageLayer, LayerData, Page, PageBuilder};
+
+// Re-export types needed by the builder
+pub use djvu_dir::{Bookmark, DjVmDir, DjVmNav, File as DjVuFile, FileType};
+pub use page_collection::{DocumentStatus, PageCollection};
+pub use page_encoder::{EncodedPage, PageComponents, PageEncodeParams, PageLayer, Rect};

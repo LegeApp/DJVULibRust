@@ -1,7 +1,7 @@
-use super::constants::ZIGZAG_LOC;
+use super::zigzag::ZIGZAG_LOC;
 use super::masking;
 use super::transform::Encode;
-use ::image::GrayImage;
+use crate::image::image_formats::Bitmap;
 
 /// Replaces `IW44Image::Block`, storing coefficients for a 32x32 image block.
 /// Uses fixed arrays instead of HashMap for maximum performance.
@@ -175,7 +175,7 @@ impl CoeffMap {
     fn create_from_transform<F>(
         width: usize,
         height: usize,
-        mask: Option<&GrayImage>,
+        mask: Option<&Bitmap>,
         transform_fn: F,
     ) -> Self
     where
@@ -196,17 +196,7 @@ impl CoeffMap {
         // See IW44Image::Map::Encode::create():
         //   IW44Image::Transform::Encode::forward(data16, iw, ih, bw, 1, 32);
         let levels = ((map.iw.min(map.ih) as f32).log2() as usize).min(5);
-        Encode::forward::<4>(&mut data16, map.iw, map.ih, map.bw, levels);
-
-        // DEBUG PRINT 2: After Wavelet Transform
-        println!(
-            "DEBUG: After wavelet transform for channel ({}x{}):",
-            width, height
-        );
-        println!(
-            "  First 16 coefficients: {:?}",
-            &data16[0..16.min(data16.len())]
-        );
+        Encode::forward(&mut data16, map.iw, map.ih, map.bw, levels);
 
         // Apply masking logic if mask is provided
         if let Some(mask_img) = mask {
@@ -222,6 +212,7 @@ impl CoeffMap {
 
         // Copy transformed coefficients into blocks
         let blocks_w = map.bw / 32;
+        // Standard iteration order (top-to-bottom, left-to-right)
         for block_y in 0..(map.bh / 32) {
             for block_x in 0..blocks_w {
                 let block_idx = block_y * blocks_w + block_x;
@@ -229,33 +220,7 @@ impl CoeffMap {
 
                 Self::copy_block_data(&mut liftblock, &data16, map.bw, block_x, block_y);
                 
-                if block_idx == 0 {
-                    if let Ok(v) = std::env::var("IW44_LIFTBLOCK_TRACE") {
-                        let v = v.trim();
-                        if !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false")) {
-                            eprint!("LIFTBLOCK_TRACE rust block=0 raw_liftblock[0..16]=[");
-                            for i in 0..16 {
-                                eprint!("{}{}", liftblock[i], if i == 15 { "" } else { ", " });
-                            }
-                            eprintln!("]");
-                        }
-                    }
-                }
-                
                 map.blocks[block_idx].read_liftblock(&liftblock);
-
-                if block_idx == 0 {
-                    if let Ok(v) = std::env::var("IW44_COEFFTRACE") {
-                        let v = v.trim();
-                        if !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false")) {
-                            if let Some(b0) = map.blocks[0].get_bucket(0) {
-                                eprintln!("COEFFTRACE rust block=0 bucket=0 coeffs={:?}", b0);
-                            } else {
-                                eprintln!("COEFFTRACE rust block=0 bucket=0 coeffs=None");
-                            }
-                        }
-                    }
-                }
             }
         }
 
@@ -263,7 +228,7 @@ impl CoeffMap {
     }
 
     /// Create coefficients from an image. Corresponds to `Map::Encode::create`.
-    pub fn create_from_image(img: &GrayImage, mask: Option<&GrayImage>) -> Self {
+    pub fn create_from_image(img: &Bitmap, mask: Option<&Bitmap>) -> Self {
         let (w, h) = img.dimensions();
         Self::create_from_transform(w as usize, h as usize, mask, |data16, iw, ih, stride| {
             Encode::from_u8_image_with_stride(img, data16, iw, ih, stride);
@@ -275,7 +240,7 @@ impl CoeffMap {
         y_buf: &[i8],
         width: u32,
         height: u32,
-        mask: Option<&GrayImage>,
+        mask: Option<&Bitmap>,
     ) -> Self {
         Self::create_from_transform(
             width as usize,
@@ -293,7 +258,7 @@ impl CoeffMap {
         channel_buf: &[i8],
         width: u32,
         height: u32,
-        mask: Option<&GrayImage>,
+        mask: Option<&Bitmap>,
         _channel_name: &str, // Keep for API compatibility but don't use for debug
     ) -> Self {
         Self::create_from_transform(
@@ -335,5 +300,5 @@ impl CoeffMap {
 
 #[cfg(test)]
 mod zigzag_tests {
-    include!("zigzag_test.rs");
+    // include!("zigzag_test.rs"); // Commented out since the file doesn't exist
 }

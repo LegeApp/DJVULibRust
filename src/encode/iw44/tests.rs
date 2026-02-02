@@ -3,6 +3,7 @@ mod tests {
     use crate::encode::iw44::encoder::{
         rgb_to_ycbcr_planes, ycbcr_from_rgb, CrcbMode, EncoderParams,
     };
+    #[cfg(test)]
     use image::{ImageBuffer, Rgb, RgbImage};
 
     /// Test color conversion with known values
@@ -192,7 +193,8 @@ mod tests {
     #[test]
     fn test_encoder_params_default() {
         let params = EncoderParams::default();
-        assert_eq!(params.decibels, Some(90.0));
+        assert_eq!(params.decibels, None);
+        assert_eq!(params.slices, Some(74));
         assert!(matches!(params.crcb_mode, CrcbMode::Full));
         assert_eq!(params.db_frac, 0.35);
     }
@@ -214,6 +216,7 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use crate::encode::iw44::encoder::{CrcbMode, EncoderParams, IWEncoder};
+    #[cfg(test)]
     use image::{GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
 
     #[test]
@@ -227,6 +230,7 @@ mod integration_tests {
             crcb_mode: CrcbMode::None,
             db_frac: 0.35,
             lossless: false,
+            quant_multiplier: 1.0,
         };
 
         let result = IWEncoder::from_gray(&img, None, params);
@@ -250,6 +254,7 @@ mod integration_tests {
             crcb_mode: CrcbMode::Full,
             db_frac: 0.35,
             lossless: false,
+            quant_multiplier: 1.0,
         };
 
         let result = IWEncoder::from_rgb(&img, None, params);

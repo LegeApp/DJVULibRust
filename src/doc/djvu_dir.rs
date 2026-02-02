@@ -388,20 +388,8 @@ impl DjVmDir {
             ByteStream::write_u8(&mut bzz_buffer, 0)?; // Null terminator
         }
 
-        println!(
-            "DEBUG: BZZ buffer before compression: {} bytes",
-            bzz_buffer.as_slice().len()
-        );
-        println!("DEBUG: BZZ data: {:02X?}", bzz_buffer.as_slice());
-
         // Use proper BZZ compression for the DIRM data according to DjVu spec
         let compressed = bzz_compress(bzz_buffer.as_slice(), 50)?; // 50KB block size for small DIRM
-
-        println!("DEBUG: BZZ compressed size: {} bytes", compressed.len());
-        println!(
-            "DEBUG: First 20 bytes of compressed data: {:02X?}",
-            &compressed[..compressed.len().min(20)]
-        );
 
         stream.write_all(&compressed)?;
 
@@ -710,6 +698,100 @@ impl DjVmDir0 {
         let file = FileRec::new(name, iff_file, offset, size);
         self.name2file.insert(name.to_string(), Arc::clone(&file));
         self.num2file.push(file);
+        Ok(())
+    }
+}
+
+// Navigation/bookmark structures (previously in djvu_nav.rs)
+
+/// Represents a single bookmark entry.
+#[derive(Debug, Clone)]
+pub struct Bookmark {
+    pub title: String,
+    /// Destination URL, typically a page ID like "#1".
+    pub dest: String,
+    /// Nested bookmarks.
+    pub children: Vec<Bookmark>,
+}
+
+/// Represents the entire navigation/bookmark structure (`NAVM` chunk).
+#[derive(Debug, Clone, Default)]
+pub struct DjVmNav {
+    pub bookmarks: Vec<Bookmark>,
+}
+
+impl DjVmNav {
+    /// Creates a new, empty navigation structure.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Counts total number of bookmarks in the tree (including nested)
+    fn count_bookmarks(&self) -> u16 {
+        fn count_recursive(bookmarks: &[Bookmark]) -> u16 {
+            let mut count = bookmarks.len() as u16;
+            for b in bookmarks {
+                count += count_recursive(&b.children);
+            }
+            count
+        }
+        count_recursive(&self.bookmarks)
+    }
+
+    /// Writes a 24-bit big-endian integer
+    fn write_int24<W: std::io::Write>(writer: &mut W, value: u32) -> std::io::Result<()> {
+        // INT24 is 3 bytes big-endian
+        writer.write_all(&[(value >> 16) as u8, (value >> 8) as u8, value as u8])
+    }
+
+    /// Encodes the navigation data into the binary format required for a `NAVM` chunk.
+    /// Format: UINT16 count, then for each bookmark: BYTE nChildren, INT24 nDesc, UTF8 sDesc, INT24 nURL, UTF8 sURL
+    pub fn encode<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
+        use byteorder::{BigEndian, WriteBytesExt};
+
+        if self.bookmarks.is_empty() {
+            return Ok(());
+        }
+
+        // Write total bookmark count (UINT16 big-endian)
+        let total = self.count_bookmarks();
+        writer.write_u16::<BigEndian>(total)?;
+
+        // Write each bookmark recursively
+        for bookmark in &self.bookmarks {
+            self.encode_bookmark_binary(bookmark, writer)?;
+        }
+
+        Ok(())
+    }
+
+    fn encode_bookmark_binary<W: std::io::Write>(
+        &self,
+        bookmark: &Bookmark,
+        writer: &mut W,
+    ) -> Result<()> {
+        // nChildren: BYTE (number of immediate children)
+        writer.write_all(&[bookmark.children.len() as u8])?;
+
+        // nDesc: INT24 (size of description/title)
+        let title_bytes = bookmark.title.as_bytes();
+        Self::write_int24(writer, title_bytes.len() as u32)?;
+
+        // sDesc: UTF8 string (the title)
+        writer.write_all(title_bytes)?;
+
+        // nURL: INT24 (size of URL)
+        let url_bytes = bookmark.dest.as_bytes();
+        Self::write_int24(writer, url_bytes.len() as u32)?;
+
+        // sURL: UTF8 string (the URL/destination)
+        writer.write_all(url_bytes)?;
+
+        // Recursively encode children
+        for child in &bookmark.children {
+            self.encode_bookmark_binary(child, writer)?;
+        }
+
         Ok(())
     }
 }

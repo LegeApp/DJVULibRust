@@ -3,7 +3,7 @@
 use super::codec::Codec;
 use super::coeff_map::CoeffMap;
 use crate::encode::zc::ZpEncoderCursor;
-use ::image::{GrayImage, RgbImage};
+use crate::image::image_formats::{Bitmap, Pixmap};
 use bytemuck;
 use log::{debug, info};
 use std::io::Cursor;
@@ -39,6 +39,11 @@ pub struct EncoderParams {
     pub crcb_mode: CrcbMode,
     pub db_frac: f32,
     pub lossless: bool,
+    /// Quantization threshold multiplier (default: 1.0)
+    /// Higher values = more aggressive filtering = smaller files, potentially lower quality
+    /// Lower values = less aggressive filtering = larger files, potentially higher quality
+    /// Range: 0.5 to 2.0 recommended
+    pub quant_multiplier: f32,
 }
 
 impl Default for EncoderParams {
@@ -50,6 +55,7 @@ impl Default for EncoderParams {
             crcb_mode: CrcbMode::Full,
             db_frac: 0.35,
             lossless: false,
+            quant_multiplier: 1.0, // Start with C++ default behavior
         }
     }
 }
@@ -59,9 +65,12 @@ fn signed_to_unsigned_u8(v: i8) -> u8 {
     (v as i16 + 128) as u8
 }
 
-fn convert_signed_buffer_to_grayscale(buf: &[i8], w: u32, h: u32) -> GrayImage {
-    let bytes: Vec<u8> = buf.iter().map(|&v| signed_to_unsigned_u8(v)).collect();
-    GrayImage::from_raw(w, h, bytes).expect("Invalid buffer dimensions")
+fn convert_signed_buffer_to_grayscale(buf: &[i8], w: u32, h: u32) -> Bitmap {
+    let pixels: Vec<crate::image::image_formats::GrayPixel> = buf
+        .iter()
+        .map(|&v| crate::image::image_formats::GrayPixel::new(signed_to_unsigned_u8(v)))
+        .collect();
+    Bitmap::from_vec(w, h, pixels)
 }
 
 const SCALE: i32 = 1 << 16;
@@ -127,7 +136,7 @@ pub fn rgb_to_ycbcr_planes(img_raw: &[u8], out_y: &mut [i8], out_cb: &mut [i8], 
 }
 
 pub fn rgb_to_ycbcr_buffers(
-    img: &RgbImage,
+    img: &Pixmap,
     out_y: &mut [i8],
     out_cb: &mut [i8],
     out_cr: &mut [i8],
@@ -140,7 +149,7 @@ pub fn rgb_to_ycbcr_buffers(
     rgb_to_ycbcr_planes(img.as_raw(), out_y, out_cb, out_cr);
 }
 
-pub fn ycbcr_from_rgb(img: &RgbImage) -> (Vec<i8>, Vec<i8>, Vec<i8>) {
+pub fn ycbcr_from_rgb(img: &Pixmap) -> (Vec<i8>, Vec<i8>, Vec<i8>) {
     let (w, h) = img.dimensions();
     let npix = (w * h) as usize;
 
@@ -161,7 +170,7 @@ pub fn make_ycbcr_codecs(
     cr_buf: &[i8],
     width: u32,
     height: u32,
-    mask: Option<&GrayImage>,
+    mask: Option<&Bitmap>,
     params: &EncoderParams,
 ) -> (Codec, Option<Codec>, Option<Codec>) {
     let ymap = CoeffMap::create_from_signed_channel(y_buf, width, height, mask, "Y");
@@ -225,8 +234,8 @@ pub fn make_ycbcr_codecs(
 }
 
 pub fn encoder_from_rgb_with_helpers(
-    img: &RgbImage,
-    mask: Option<&GrayImage>,
+    img: &Pixmap,
+    mask: Option<&Bitmap>,
     params: EncoderParams,
 ) -> Result<IWEncoder, EncoderError> {
     let (w, h) = img.dimensions();
@@ -248,13 +257,17 @@ pub fn encoder_from_rgb_with_helpers(
             CrcbMode::Normal => 10,
             CrcbMode::Full => 0,
         },
-        // Note: curbit/curband now owned by each codec (initialized in Codec::new)
+        crcb_half: match params.crcb_mode {
+            CrcbMode::Half => true,
+            _ => false,
+        },
+        // Note: curbit/curband state is now owned by each codec (initialized in Codec::new)
     })
 }
 
 pub fn encoder_from_gray_with_helpers(
-    img: &GrayImage,
-    mask: Option<&GrayImage>,
+    img: &Bitmap,
+    mask: Option<&Bitmap>,
     params: EncoderParams,
 ) -> Result<IWEncoder, EncoderError> {
     let ymap = CoeffMap::create_from_image(img, mask);
@@ -269,7 +282,8 @@ pub fn encoder_from_gray_with_helpers(
         total_bytes: 0,
         serial: 0,
         crcb_delay: -1,
-        // Note: curbit/curband now owned by each codec (initialized in Codec::new)
+        crcb_half: false,  // Grayscale has no chroma
+        // Note: curbit/curband state is now owned by each codec (initialized in Codec::new)
     })
 }
 
@@ -282,21 +296,22 @@ pub struct IWEncoder {
     total_bytes: usize,
     serial: u8,
     crcb_delay: i32,
+    crcb_half: bool,  // Added to match C++ behavior
     // Note: curbit/curband state is now owned by each codec independently
 }
 
 impl IWEncoder {
     pub fn from_gray(
-        img: &GrayImage,
-        mask: Option<&GrayImage>,
+        img: &Bitmap,
+        mask: Option<&Bitmap>,
         params: EncoderParams,
     ) -> Result<Self, EncoderError> {
         encoder_from_gray_with_helpers(img, mask, params)
     }
 
     pub fn from_rgb(
-        img: &RgbImage,
-        mask: Option<&GrayImage>,
+        img: &Pixmap,
+        mask: Option<&Bitmap>,
         params: EncoderParams,
     ) -> Result<Self, EncoderError> {
         info!(
@@ -339,6 +354,10 @@ impl IWEncoder {
         let mut slices_encoded = 0;
         let mut estdb = -1.0;
 
+        // IMPORTANT: Do NOT reset contexts between progressive chunks of the same image
+        // Contexts should only be reset when creating a new encoder for a different image
+        // The ZP encoder's adaptive state must persist across progressive chunks
+
         let _more = self.y_codec.curbit >= 0;
         while slices_encoded < max_slices && self.y_codec.curbit >= 0 {
             // Track bytes before this slice
@@ -353,15 +372,8 @@ impl IWEncoder {
             let bytes_after = zp_impl.tell_bytes();
             let slice_bytes = bytes_after - bytes_before;
 
-            if slice_bytes > 0 {
-                eprintln!(
-                    "SLICE_DEBUG: slice={}, bit={}, band={}, slice_bytes={}, total_bytes={}",
-                    slices_encoded, self.y_codec.curbit, self.y_codec.curband, slice_bytes, bytes_after
-                );
-            }
+            let _ = (slice_bytes, bytes_after, bytes_before);
 
-            // Cb and Cr codecs encode if they exist and delay conditions are met
-            // Each codec advances its own state independently
             if let Some(ref mut cb) = self.cb_codec {
                 if self.total_slices as i32 >= self.crcb_delay {
                     debug!("Encoding Cb slice {}", self.total_slices);
@@ -381,14 +393,17 @@ impl IWEncoder {
             slices_encoded += 1;
             self.total_slices += 1;
 
-            // Check slice limit (matches C44's default -slice 74+13+10+10)
-            if let Some(slice_limit) = self.params.slices {
-                if slices_encoded >= slice_limit {
-                    info!(
-                        "encode_chunk: Reached slice limit {}, stopping",
-                        slice_limit
-                    );
-                    break;
+            // Check slice limit only if not overridden by max_slices parameter
+            // When max_slices is usize::MAX, we encode all remaining slices
+            if max_slices < usize::MAX {
+                if let Some(slice_limit) = self.params.slices {
+                    if slices_encoded >= slice_limit {
+                        info!(
+                            "encode_chunk: Reached slice limit {}, stopping",
+                            slice_limit
+                        );
+                        break;
+                    }
                 }
             }
 
@@ -409,13 +424,10 @@ impl IWEncoder {
             // Quality control - estimate decibels (skip if lossless mode)
             if !self.params.lossless {
                 if let Some(db_target) = self.params.decibels {
-                    if self.y_codec.curband == 0 || estdb >= db_target - super::constants::DECIBEL_PRUNE {
+                    // Always check quality after first slice or when appropriate
+                    if slices_encoded > 0 || self.y_codec.curband == 0 || estdb >= db_target - super::constants::DECIBEL_PRUNE {
                         estdb = self.y_codec.estimate_decibel(self.params.db_frac);
                         if estdb >= db_target {
-                            info!(
-                                "encode_chunk: Reached target decibels {:.2}, stopping",
-                                db_target
-                            );
                             self.y_codec.curbit = -1;
                             break;
                         }
@@ -426,6 +438,9 @@ impl IWEncoder {
 
         // Finish on the concrete implementation
         let zp_data = zp_impl.finish()?.into_inner();
+
+        // Print bit count summary if enabled (for size gap investigation)
+        crate::encode::iw44::codec::print_bit_counts();
 
         // Debug: Check for suspicious repeating patterns in ZP data
         if zp_data.len() > 100 {
@@ -452,29 +467,33 @@ impl IWEncoder {
             }
         }
 
-        if slices_encoded == 0 || zp_data.is_empty() {
-            info!("encode_chunk: No new data encoded (slices_encoded={}, zp_data_len={}). Returning empty chunk.", slices_encoded, zp_data.len());
+        if slices_encoded == 0 {
+            info!(
+                "encode_chunk: No slices encoded (slices_encoded=0). Returning empty chunk."
+            );
             return Ok((Vec::new(), false));
         }
 
-        eprintln!(
-            "[DEBUG] encode_chunk: Finished encoding {} slices. ZEncoder produced {} bytes.",
-            slices_encoded,
-            zp_data.len()
-        );
-        eprintln!(
-            "[DEBUG] IW44 header will be {} bytes, total chunk: {} bytes",
-            if self.serial == 0 { 9 } else { 2 },
-            zp_data.len() + if self.serial == 0 { 9 } else { 2 }
-        );
+        // IMPORTANT: DjVuLibre may output a chunk that contains only headers (no ZP payload)
+        // when all processed slices are null. The slice count in the primary header is still
+        // meaningful to the decoder. Therefore we must not drop the chunk when zp_data is empty.
+        if zp_data.is_empty() {
+            info!(
+                "encode_chunk: Encoded {} slices but ZP payload is empty (all-null slices). Emitting header-only chunk.",
+                slices_encoded
+            );
+        }
 
         // Write IW44 chunk header
         chunk_data.push(self.serial);
         chunk_data.push(slices_encoded as u8);
 
+        // Full secondary header only for the first chunk (serial == 0)
         if self.serial == 0 {
             let is_color = self.cb_codec.is_some() && self.cr_codec.is_some();
-            let major = if is_color { 1 } else { 0x81 }; // Version 1, 0x80 for grayscale
+            // Major version: bit 7 set (0x80) indicates grayscale/BM44, clear indicates color/PM44
+            // C++ uses: major = 1 | 0x80 for grayscale, major = 1 for color
+            let major = if is_color { 1 } else { 1 | 0x80 };
             chunk_data.push(major);
             chunk_data.push(2); // Minor version 2 per C++
             chunk_data.extend_from_slice(&(w as u16).to_be_bytes());
@@ -482,10 +501,13 @@ impl IWEncoder {
 
             // Tertiary header CrCbDelay byte: For grayscale (no chroma), use 0x00.
             // For color images, set 0x80 flag and OR in the delay value.
-            // This matches C44's behavior: grayscale images get crcbdelay=0x00.
+            // From C++ IW44EncodeCodec.cpp:
+            // - CRCBfull: crcb_half=0, crcb_delay=0 -> crcbdelay = 0x80 | 0 = 0x80
+            // - CRCBnormal: crcb_half=0, crcb_delay=10 -> crcbdelay = 0x80 | 10 = 0x8a
+            // - CRCBhalf: crcb_half=1, crcb_delay=10 -> crcbdelay = 0x00 | 10 = 0x0a
             let crcb_delay_byte: u8 = if is_color {
                 let mut byte = 0x80;
-                if self.crcb_delay >= 0 {
+                if self.crcb_delay >= 0 && !self.crcb_half {
                     byte |= self.crcb_delay as u8;
                 }
                 byte
@@ -495,23 +517,16 @@ impl IWEncoder {
             chunk_data.push(crcb_delay_byte);
         }
 
+        // Append ZP payload
         chunk_data.extend_from_slice(&zp_data);
-
-        info!(
-            "encode_chunk: Created chunk with serial {}. Total chunk size: {} bytes.",
-            self.serial,
-            chunk_data.len()
-        );
-
-        self.serial = self.serial.wrapping_add(1);
-        self.total_bytes += chunk_data.len();
-
-        // More data remains if we haven't exhausted all bitplanes.
-        // The encoder terminates when Y codec's curbit < 0 (all bitplanes done) OR when quality target is reached
+        
+        // Determine if more chunks are needed
         let more = self.y_codec.curbit >= 0;
+
+        // Increment serial for next chunk
+        self.serial = self.serial.wrapping_add(1);
+
         Ok((chunk_data, more))
     }
-
-    // NOTE: Slice scheduling logic removed from here - now handled only in Codec::code_slice
-    // to match C++ structure where finish_code_slice is called from code_slice
+    
 }

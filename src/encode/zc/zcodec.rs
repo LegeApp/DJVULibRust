@@ -100,7 +100,6 @@ impl<W: Write> ZEncoder<W> {
 
         // CRITICAL: z = a + p[ctx], not just p[ctx]!
         let z = self.a + self.table[*ctx as usize].p as u32;
-
         if bit != (*ctx & 1 != 0) {
             // LPS path
             self.encode_lps(ctx, z)?;
@@ -113,6 +112,31 @@ impl<W: Write> ZEncoder<W> {
         }
 
         Ok(())
+    }
+
+    /// Encodes a bit without compression (pass-thru encoder).
+    ///
+    /// Matches DjVuLibre `ZPCodec::encoder(int bit)`:
+    /// Raw bit encoding for IWencoder. Matches C++ ZPCodec::IWencoder.
+    /// ```cpp
+    /// const int z = 0x8000 + ((a+a+a) >> 3);
+    /// if (bit) encode_lps_simple(z);
+    /// else     encode_mps_simple(z);
+    /// ```
+    #[inline(always)]
+    pub fn encode_raw(&mut self, bit: bool) -> Result<(), ZCodecError> {
+        if self.finished {
+            return Err(ZCodecError::Finished);
+        }
+
+        // CRITICAL: Match C++ formula exactly: z = 0x8000 + ((a+a+a) >> 3)
+        // This gives z = 0x8000 + 3*a/8, NOT 0x8000 + a/2
+        let z = 0x8000u32 + ((self.a + self.a + self.a) >> 3);
+        if bit {
+            self.encode_lps_simple(z)
+        } else {
+            self.encode_mps_simple(z)
+        }
     }
 
     #[inline(always)]
@@ -180,6 +204,7 @@ impl<W: Write> ZEncoder<W> {
         self.buffer = (self.buffer << 1).wrapping_add(bit as u32);
         let b = (self.buffer >> 24) as u8;
         self.buffer &= 0x00ff_ffff;
+
         match b {
             1 => {
                 self.outbit(1)?;
@@ -382,17 +407,11 @@ impl<W: Write> ZEncoder<W> {
         self.writer.take().ok_or(ZCodecError::Finished)
     }
 
-    // IW44 specific encoding methods
 
-    /// IWencoder for IW44 compatibility - uses fixed-probability (non-adaptive) coding.
+    /// Iwencoder for IW44 compatibility - uses fixed-probability (non-adaptive) coding.
     #[inline(always)]
-    pub fn IWencoder(&mut self, bit: bool) -> Result<(), ZCodecError> {
-        let z = 0x8000u32 + ((self.a + self.a + self.a) >> 3);
-        if bit {
-            self.encode_lps_simple(z)
-        } else {
-            self.encode_mps_simple(z)
-        }
+    pub fn iwencoder(&mut self, bit: bool) -> Result<(), ZCodecError> {
+        self.encode_raw(bit)
     }
 
     /// Encodes a bit with context-based routing (adaptive vs fixed-probability).
@@ -406,7 +425,7 @@ impl<W: Write> ZEncoder<W> {
         match *ctx {
             RAW_CONTEXT_128 | RAW_CONTEXT_129 => {
                 // Fixed-probability path – no context update
-                self.IWencoder(bit)
+                self.iwencoder(bit)
             }
             _ => {
                 // Normal adaptive arithmetic coding
@@ -419,9 +438,7 @@ impl<W: Write> ZEncoder<W> {
 impl<W: Write> Drop for ZEncoder<W> {
     fn drop(&mut self) {
         if !self.finished {
-            if let Err(e) = self.eflush() {
-                eprintln!("Warning: ZEncoder failed to flush on drop: {}", e);
-            }
+            let _ = self.eflush();
         }
     }
 }
@@ -468,8 +485,12 @@ impl ZpEncoderCursor for ZEncoder<Cursor<Vec<u8>>> {
         self.encode(bit, ctx)
     }
 
-    fn IWencoder(&mut self, bit: bool) -> Result<(), ZCodecError> {
-        self.IWencoder(bit)
+    fn iwencoder(&mut self, bit: bool) -> Result<(), ZCodecError> {
+        self.iwencoder(bit)
+    }
+
+    fn encode_raw_bit(&mut self, bit: bool) -> Result<(), ZCodecError> {
+        self.encode_raw(bit)
     }
 
     fn tell_bytes(&self) -> usize {

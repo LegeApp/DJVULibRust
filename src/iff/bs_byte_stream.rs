@@ -26,7 +26,7 @@ pub struct BsEncoder<W: Write> {
 impl<W: Write> BsEncoder<W> {
     pub fn new(writer: W, block_size_k: usize) -> Result<Self> {
         let block_size = (block_size_k * 1024).clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
-        let zp_encoder = RustZEncoder::new(writer, false)?; // Apply ZPCODER patch
+        let zp_encoder = RustZEncoder::new(writer, true)?; // djvu_compat=true to match C++ BSByteStream
         Ok(Self {
             zp_encoder,
             buffer: Vec::with_capacity(block_size + OVERFLOW),
@@ -39,9 +39,11 @@ impl<W: Write> BsEncoder<W> {
             return Ok(());
         }
 
-        // Record size BEFORE adding sentinel (critical for DjVu compatibility)
-        let size = self.buffer.len() as u32; // length *without* sentinel
+        // DjVuLibre encodes the size INCLUDING the sentinel byte.
+        // It also sets markerpos = size-1 (the sentinel position in the original buffer)
+        // before sorting, and the sort returns the marker position in the BWT output.
         self.buffer.push(0); // add sentinel
+        let size = self.buffer.len() as u32;
 
         // 1. Burrows-Wheeler Transform
         let (mut transformed_block, markerpos) = self.bwt(&self.buffer);
@@ -54,64 +56,62 @@ impl<W: Write> BsEncoder<W> {
     }
 
     /// Performs the Burrows-Wheeler Transform on the input data.
-    fn bwt(&self, data: &[u8]) -> (Vec<u8>, usize) {
-        let len = data.len();
+    fn bwt(&self, block: &[u8]) -> (Vec<u8>, usize) {
+        let len = block.len();
+        assert!(len > 0);
         if len == 0 {
             return (Vec::new(), 0);
         }
 
-        // BWT implementation - ensure this matches the C++ version exactly
+        // BWT implementation: DjVu requires the sentinel (last byte) to be unique and
+        // strictly smaller than any other byte to keep all rotations unique.
+        // The decoder assumes this property for reversibility.
         let mut rotations: Vec<usize> = (0..len).collect();
         rotations.sort_by(|&a, &b| {
-            let a_rot = data[a..].iter().chain(data[..a].iter());
-            let b_rot = data[b..].iter().chain(data[..b].iter());
-            a_rot.cmp(b_rot)
+            for k in 0..len {
+                let ia = (a + k) % len;
+                let ib = (b + k) % len;
+                let va = if ia == len - 1 { -1i32 } else { block[ia] as i32 };
+                let vb = if ib == len - 1 { -1i32 } else { block[ib] as i32 };
+                if va != vb {
+                    return va.cmp(&vb);
+                }
+            }
+            std::cmp::Ordering::Equal
         });
 
         let mut last_col = vec![0u8; len];
-        let mut primary_index = 0;
+        // In DjVuLibre this value must be in 1..size-1 (decoder rejects 0).
+        // The marker position is the primary index of the BWT: the position of the
+        // rotation starting at 0 in the sorted rotations list.
+        let mut markerpos = 0usize;
         for (i, &start) in rotations.iter().enumerate() {
             if start == 0 {
-                primary_index = i;
+                markerpos = i;
             }
-            last_col[i] = data[(start + len - 1) % len];
+            last_col[i] = block[(start + len - 1) % len];
         }
 
-        println!(
-            "DEBUG BWT: Input length={}, primary_index={}, first 10 bytes of output: {:?}",
-            len,
-            primary_index,
-            &last_col[..10.min(len)]
-        );
-
-        (last_col, primary_index)
+        (last_col, markerpos)
     }
 
     /// Encodes the transformed block with MTF and ZP encoding.
     fn encode_transformed(&mut self, data: &mut [u8], size: u32, markerpos: usize) -> Result<()> {
-        println!(
-            "DEBUG BZZ: Encoding block size={}, markerpos={}",
-            size, markerpos
-        );
-
         // Header: encode block size
         self.encode_raw(24, size)?;
 
         // Determine and encode estimation speed
-        let mut fshift_ctx: BitContext = 0; // Create real context instead of literal
+        // DjVuLibre uses pass-thru coding for these bits: zp.encoder(bit)
         let fshift = if size < FREQS0 {
-            println!("DEBUG BZZ: Using fshift=0 (size {} < {})", size, FREQS0);
-            self.zp_encoder.encode(false, &mut fshift_ctx)?;
+            self.zp_encoder.encode_raw(false)?;
             0
         } else if size < FREQS1 {
-            println!("DEBUG BZZ: Using fshift=1 (size {} < {})", size, FREQS1);
-            self.zp_encoder.encode(true, &mut fshift_ctx)?;
-            self.zp_encoder.encode(false, &mut fshift_ctx)?;
+            self.zp_encoder.encode_raw(true)?;
+            self.zp_encoder.encode_raw(false)?;
             1
         } else {
-            println!("DEBUG BZZ: Using fshift=2 (size {} >= {})", size, FREQS1);
-            self.zp_encoder.encode(true, &mut fshift_ctx)?;
-            self.zp_encoder.encode(true, &mut fshift_ctx)?;
+            self.zp_encoder.encode_raw(true)?;
+            self.zp_encoder.encode_raw(true)?;
             2
         };
 
@@ -122,7 +122,7 @@ impl<W: Write> BsEncoder<W> {
             rmtf[val as usize] = i as u8;
         }
         let mut freq = [0u32; FREQMAX];
-        let fadd = 4u32;
+        let mut fadd = 4u32;
 
         // Encode data with MTF and ZP
         let mut mtfno = 3; // This should be mutable and track current MTF state
@@ -145,14 +145,10 @@ impl<W: Write> BsEncoder<W> {
 
             let mut cx_idx = 0;
             let bit = mtfno_current == 0;
-            println!(
-                "DEBUG BZZ: Encoding bit={} for mtfno={} at position {}",
-                bit, mtfno_current, i
-            );
             self.zp_encoder
                 .encode(bit, &mut contexts[cx_idx + ctxid as usize])?;
             if bit {
-                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, fadd, fshift as u8);
+                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, &mut fadd, fshift as u8);
                 continue;
             }
 
@@ -161,7 +157,7 @@ impl<W: Write> BsEncoder<W> {
             self.zp_encoder
                 .encode(bit, &mut contexts[cx_idx + ctxid as usize])?;
             if bit {
-                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, fadd, fshift as u8);
+                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, &mut fadd, fshift as u8);
                 continue;
             }
 
@@ -170,7 +166,7 @@ impl<W: Write> BsEncoder<W> {
             self.zp_encoder.encode(bit, &mut contexts[cx_idx])?;
             if bit {
                 self.encode_binary(&mut contexts[cx_idx + 1..], 1, mtfno_current - 2)?;
-                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, fadd, fshift as u8);
+                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, &mut fadd, fshift as u8);
                 continue;
             }
 
@@ -179,7 +175,7 @@ impl<W: Write> BsEncoder<W> {
             self.zp_encoder.encode(bit, &mut contexts[cx_idx])?;
             if bit {
                 self.encode_binary(&mut contexts[cx_idx + 1..], 2, mtfno_current - 4)?;
-                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, fadd, fshift as u8);
+                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, &mut fadd, fshift as u8);
                 continue;
             }
 
@@ -188,7 +184,7 @@ impl<W: Write> BsEncoder<W> {
             self.zp_encoder.encode(bit, &mut contexts[cx_idx])?;
             if bit {
                 self.encode_binary(&mut contexts[cx_idx + 1..], 3, mtfno_current - 8)?;
-                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, fadd, fshift as u8);
+                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, &mut fadd, fshift as u8);
                 continue;
             }
 
@@ -197,7 +193,7 @@ impl<W: Write> BsEncoder<W> {
             self.zp_encoder.encode(bit, &mut contexts[cx_idx])?;
             if bit {
                 self.encode_binary(&mut contexts[cx_idx + 1..], 4, mtfno_current - 16)?;
-                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, fadd, fshift as u8);
+                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, &mut fadd, fshift as u8);
                 continue;
             }
 
@@ -206,7 +202,7 @@ impl<W: Write> BsEncoder<W> {
             self.zp_encoder.encode(bit, &mut contexts[cx_idx])?;
             if bit {
                 self.encode_binary(&mut contexts[cx_idx + 1..], 5, mtfno_current - 32)?;
-                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, fadd, fshift as u8);
+                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, &mut fadd, fshift as u8);
                 continue;
             }
 
@@ -215,7 +211,7 @@ impl<W: Write> BsEncoder<W> {
             self.zp_encoder.encode(bit, &mut contexts[cx_idx])?;
             if bit {
                 self.encode_binary(&mut contexts[cx_idx + 1..], 6, mtfno_current - 64)?;
-                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, fadd, fshift as u8);
+                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, &mut fadd, fshift as u8);
                 continue;
             }
 
@@ -224,26 +220,34 @@ impl<W: Write> BsEncoder<W> {
             self.zp_encoder.encode(bit, &mut contexts[cx_idx])?;
             if bit {
                 self.encode_binary(&mut contexts[cx_idx + 1..], 7, mtfno_current - 128)?;
-                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, fadd, fshift as u8);
+                self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, &mut fadd, fshift as u8);
                 continue;
             }
 
-            // Marker position (mtfno == 256)
-            self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, fadd, fshift as u8);
+            // Marker position (mtfno == 256): DjVuLibre does not rotate.
+            if mtfno_current == 256 {
+                continue;
+            }
+
+            // Should not be reachable, but keep behavior consistent.
+            self.rotate_mtf(&mut mtf, &mut rmtf, &mut freq, c, &mut fadd, fshift as u8);
         }
 
         Ok(())
     }
 
     /// Encodes a raw integer value with the specified number of bits.
+    /// Matches C++ encode_raw exactly: tree-based encoding using zp.encoder(b)
     fn encode_raw(&mut self, bits: u8, x: u32) -> Result<()> {
-        println!("DEBUG BZZ: encode_raw bits={}, x={}", bits, x);
-        // Write bits MSB-first, as required by DjVu spec
-        let mut raw_ctx: BitContext = 0;
-        for i in (0..bits).rev() {
-            let b = ((x >> i) & 1) != 0;
-            println!("DEBUG BZZ: encode_raw bit={}", b);
-            self.zp_encoder.encode(b, &mut raw_ctx)?;
+        let mut n = 1u32;
+        let m = 1u32 << bits;
+        let mut x = x;
+        while n < m {
+            x = (x & (m - 1)) << 1;
+            let b = (x >> bits) != 0;
+            // Use raw encoder (no context) - matches C++ zp.encoder(b)
+            self.zp_encoder.encode_raw(b)?;
+            n = (n << 1) | (b as u32);
         }
         Ok(())
     }
@@ -280,21 +284,21 @@ impl<W: Write> BsEncoder<W> {
         rmtf: &mut [u8],
         freq: &mut [u32; FREQMAX],
         c: u8,
-        mut fadd: u32,
+        fadd: &mut u32,
         fshift: u8,
     ) {
         let mtfno = rmtf[c as usize] as usize; // Get current MTF position of character
 
         // Adjust frequencies for overflow (matches C++ exactly)
-        fadd = fadd + (fadd >> fshift);
-        if fadd > 0x10000000 {
-            fadd = fadd >> 24;
+        *fadd = *fadd + (*fadd >> fshift);
+        if *fadd > 0x10000000 {
+            *fadd = *fadd >> 24;
             for f in freq.iter_mut() {
                 *f = *f >> 24;
             }
         }
 
-        let mut fc = fadd;
+        let mut fc = *fadd;
         if mtfno < FREQMAX {
             fc += freq[mtfno];
         }
@@ -347,16 +351,10 @@ impl<W: Write> Write for BsEncoder<W> {
 
 impl<W: Write> Drop for BsEncoder<W> {
     fn drop(&mut self) {
-        println!("DEBUG BZZ: Drop called - flushing remaining data and writing EOF marker");
         let _ = self.flush();
         // Encode EOF marker (zero-length block) - matches C++ BSByteStream::Encode::~Encode()
-        if let Ok(_) = self.encode_raw(24, 0) {
-            println!("DEBUG BZZ: EOF marker written successfully");
-        } else {
-            println!("DEBUG BZZ: ERROR writing EOF marker!");
-        }
+        let _ = self.encode_raw(24, 0);
         // Note: ZEncoder will be dropped naturally, which calls its Drop impl that flushes
-        println!("DEBUG BZZ: BsEncoder drop complete, ZEncoder will be dropped next");
     }
 }
 

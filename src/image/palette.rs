@@ -10,7 +10,6 @@
 
 use crate::image::image_formats::{Pixel, Pixmap};
 use crate::utils::error::{DjvuError, Result};
-use ::image::Rgb;
 use bytemuck::{cast_slice, Pod, Zeroable};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Write};
@@ -65,28 +64,28 @@ pub struct RgbaColor {
     pub a: u8,
 }
 
-impl From<Rgb<u8>> for BgrColor {
-    fn from(rgb: Rgb<u8>) -> Self {
+impl From<Pixel> for BgrColor {
+    fn from(pixel: Pixel) -> Self {
         BgrColor {
-            b: rgb.0[2],
-            g: rgb.0[1],
-            r: rgb.0[0],
+            b: pixel.b,
+            g: pixel.g,
+            r: pixel.r,
         }
     }
 }
 
-impl From<BgrColor> for Rgb<u8> {
+impl From<BgrColor> for Pixel {
     fn from(bgr: BgrColor) -> Self {
-        Rgb([bgr.r, bgr.g, bgr.b])
+        Pixel::new(bgr.r, bgr.g, bgr.b)
     }
 }
 
-impl From<Rgb<u8>> for RgbaColor {
-    fn from(rgb: Rgb<u8>) -> Self {
+impl From<Pixel> for RgbaColor {
+    fn from(pixel: Pixel) -> Self {
         RgbaColor {
-            r: rgb.0[0],
-            g: rgb.0[1],
-            b: rgb.0[2],
+            r: pixel.r,
+            g: pixel.g,
+            b: pixel.b,
             a: 255,
         }
     }
@@ -97,7 +96,7 @@ impl From<Rgb<u8>> for RgbaColor {
 /// A trait for algorithms that can create a color palette from a set of pixels.
 pub trait Quantizer {
     /// Takes a slice of RGB pixels and returns a palette of at most `max_colors`.
-    fn quantize(&self, pixels: &[Rgb<u8>], max_colors: usize) -> Vec<Rgb<u8>>;
+    fn quantize(&self, pixels: &[Pixel], max_colors: usize) -> Vec<Pixel>;
 }
 
 /// A high-speed color quantizer based on the NeuQuant algorithm.
@@ -110,9 +109,9 @@ pub struct NeuQuantQuantizer {
 
 impl Quantizer for NeuQuantQuantizer {
     /// Runs the NeuQuant algorithm on the input pixels to generate a palette.
-    fn quantize(&self, pixels: &[Rgb<u8>], max_colors: usize) -> Vec<Rgb<u8>> {
+    fn quantize(&self, pixels: &[Pixel], max_colors: usize) -> Vec<Pixel> {
         // Convert RGB to RGBA using bytemuck for efficient zero-copy conversion
-        let rgba_colors: Vec<RgbaColor> = pixels.iter().map(|&rgb| rgb.into()).collect();
+        let rgba_colors: Vec<RgbaColor> = pixels.iter().map(|&pixel| pixel.into()).collect();
         let rgba_bytes: &[u8] = cast_slice(&rgba_colors);
 
         let nq = your_neuquant::NeuQuant::new(self.sample_factor, max_colors, rgba_bytes);
@@ -122,7 +121,7 @@ impl Quantizer for NeuQuantQuantizer {
         let rgba_colors: &[RgbaColor] = cast_slice(&palette_rgba_bytes);
         rgba_colors
             .iter()
-            .map(|&rgba| Rgb([rgba.r, rgba.g, rgba.b]))
+            .map(|&rgba| Pixel::new(rgba.r, rgba.g, rgba.b))
             .collect()
     }
 }
@@ -147,7 +146,7 @@ impl Palette {
     /// * `max_colors` - The maximum number of colors the final palette should have.
     /// * `quantizer` - An object that implements the `Quantizer` trait.
     pub fn new(image: &Pixmap, max_colors: usize, quantizer: &impl Quantizer) -> Self {
-        let pixels: Vec<Pixel> = image.pixels().cloned().collect();
+        let pixels: Vec<Pixel> = image.pixels().to_vec();
         let colors = quantizer.quantize(&pixels, max_colors);
         Palette {
             colors,
@@ -177,9 +176,9 @@ impl Palette {
             .iter()
             .enumerate()
             .min_by_key(|(_, pal_color)| {
-                let dr = pal_color.0[0] as i32 - color.0[0] as i32;
-                let dg = pal_color.0[1] as i32 - color.0[1] as i32;
-                let db = pal_color.0[2] as i32 - color.0[2] as i32;
+                let dr = pal_color.r as i32 - color.r as i32;
+                let dg = pal_color.g as i32 - color.g as i32;
+                let db = pal_color.b as i32 - color.b as i32;
                 // Use squared Euclidean distance to avoid sqrt
                 dr * dr + dg * dg + db * db
             })
@@ -188,20 +187,20 @@ impl Palette {
     }
 
     /// Efficiently converts a slice of RGB pixels to color indices using bytemuck operations.
-    pub fn pixels_to_indices(&self, pixels: &[Rgb<u8>]) -> Vec<u16> {
+    pub fn pixels_to_indices(&self, pixels: &[Pixel]) -> Vec<u16> {
         pixels
             .iter()
             .map(|pixel| self.color_to_index(pixel))
             .collect()
     }
 
-    pub fn indices_to_pixels(&self, indices: &[u16]) -> Vec<Rgb<u8>> {
+    pub fn indices_to_pixels(&self, indices: &[u16]) -> Vec<Pixel> {
         indices
             .iter()
             .map(|&index| {
                 self.index_to_color(index)
                     .copied()
-                    .unwrap_or(Rgb([0, 0, 0])) // Default to black for invalid indices
+                    .unwrap_or(Pixel::black()) // Default to black for invalid indices
             })
             .collect()
     }
@@ -288,7 +287,7 @@ impl Palette {
         let mut bgr_bytes = vec![0u8; palette_size * 3];
         reader.read_exact(&mut bgr_bytes)?;
         let bgr_colors: &[BgrColor] = cast_slice(&bgr_bytes);
-        let colors: Vec<Rgb<u8>> = bgr_colors.iter().map(|&bgr| bgr.into()).collect();
+        let colors: Vec<Pixel> = bgr_colors.iter().map(|&bgr| bgr.into()).collect();
 
         let mut color_indices = Vec::new();
         if (version & 0x80) != 0 {

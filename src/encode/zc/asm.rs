@@ -270,6 +270,16 @@ impl ZpEncoderCursor for ZEncoder<Cursor<Vec<u8>>> {
     fn IWencoder(&mut self, bit: bool) -> Result<(), ZCodecError> {
         ZEncoder::IWencoder(self, bit)
     }
+    #[inline(always)]
+    fn encode_raw_bit(&mut self, bit: bool) -> Result<(), ZCodecError> {
+        ZEncoder::encode_raw(self, bit)
+    }
+    fn tell_bytes(&self) -> usize {
+        self.writer
+            .as_ref()
+            .map(|w| w.as_ref().get_ref().len())
+            .unwrap_or(0)
+    }
     fn finish(self) -> Result<Cursor<Vec<u8>>, ZCodecError> {
         ZEncoder::finish(self)
     }

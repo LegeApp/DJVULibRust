@@ -13,6 +13,7 @@ pub enum AnnotationError {
 }
 
 /// Represents the shape of a hyperlink area.
+#[derive(Debug, Clone)]
 pub enum AnnotationShape {
     Rect { x: u32, y: u32, w: u32, h: u32 },
     Oval { x: u32, y: u32, w: u32, h: u32 },
@@ -37,6 +38,7 @@ impl fmt::Display for AnnotationShape {
 }
 
 /// Represents a single hyperlink or clickable map area.
+#[derive(Debug, Clone)]
 pub struct Hyperlink {
     pub shape: AnnotationShape,
     pub url: String,
@@ -46,7 +48,7 @@ pub struct Hyperlink {
 }
 
 /// Represents the full set of annotations for a page.
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 pub struct Annotations {
     pub hyperlinks: Vec<Hyperlink>,
     pub metadata: Vec<(String, String)>,

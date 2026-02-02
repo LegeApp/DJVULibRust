@@ -259,8 +259,8 @@ pub fn analyze_colors(ppm_data: &PpmData) -> ColorAnalysis {
     // Find most common color
     let most_common_color = color_counts
         .iter()
-        .max_by_key(|(_, &count)| count)
-        .map(|(color, &count)| (color.clone(), count));
+        .max_by_key(|(_, count)| *count)
+        .map(|(color, count)| (color.clone(), *count));
 
     ColorAnalysis {
         total_pixels,

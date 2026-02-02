@@ -97,10 +97,10 @@ impl NumCoder {
             )));
         }
 
-        let mut negative = false;
         let mut cutoff: i32 = 0;
         let mut phase = 1;
         let mut range: u32 = 0xffffffff;
+        let mut negative;
 
         // We track the current position using an enum to handle the pointer-to-pointer semantics
         // In DjVuLibre: pctx points to either the root ctx, or to leftcell[x] or rightcell[x]
@@ -250,8 +250,8 @@ pub fn encode_integer_simple<W: Write>(
 
     // For simple cases, just encode sign and magnitude
     let mut v = value;
-    let mut lo = low;
-    let mut hi = high;
+    let lo = low;
+    let hi = high;
 
     // Phase 1: Sign
     if lo < 0 && hi >= 0 {
@@ -259,15 +259,11 @@ pub fn encode_integer_simple<W: Write>(
         zc.encode(negative, &mut contexts[base_context])?;
         if negative {
             v = -v - 1;
-            let temp = -lo - 1;
-            lo = -hi - 1;
-            hi = temp;
+            // Range transformation not needed in simplified encoder
         }
     } else if lo < 0 {
         v = -v - 1;
-        let temp = -lo - 1;
-        lo = -hi - 1;
-        hi = temp;
+        // Range transformation not needed in simplified encoder
     }
 
     // Phase 2 & 3: Binary encode the value

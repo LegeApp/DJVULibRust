@@ -5,13 +5,106 @@ use crate::encode::{
     jb2::encoder::JB2Encoder,
     symbol_dict::BitImage,
 };
+use crate::annotations::{Annotations, hidden_text::HiddenText};
 use crate::iff::{bs_byte_stream::bzz_compress, iff::IffWriter};
+use crate::image::image_formats::{Bitmap, GrayPixel, Pixel, Pixmap};
 use crate::{DjvuError, Result};
 use byteorder::{BigEndian, WriteBytesExt};
-use image::RgbImage;
 use log::debug;
-use lutz::Image;
 use std::io::{self, Write};
+use std::sync::Arc;
+
+fn blit_bit_image(dst: &mut BitImage, src: &BitImage, x0: u32, y0: u32) {
+    let x0 = x0 as usize;
+    let y0 = y0 as usize;
+    for y in 0..src.height {
+        let dy = y0 + y;
+        if dy >= dst.height {
+            continue;
+        }
+        for x in 0..src.width {
+            let dx = x0 + x;
+            if dx >= dst.width {
+                continue;
+            }
+            let v = src.get_pixel_unchecked(x, y);
+            dst.set_usize(dx, dy, v);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Rect {
+    pub fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub fn from_dimensions(width: u32, height: u32) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PageLayer {
+    IW44Background { image: Pixmap, rect: Rect },
+    JB2Foreground { image: BitImage, rect: Rect },
+    JB2Mask { image: BitImage, rect: Rect },
+}
+
+#[derive(Clone)]
+pub struct EncodedPage {
+    pub page_num: usize,
+    pub data: Arc<Vec<u8>>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl EncodedPage {
+    pub fn new(page_num: usize, data: Vec<u8>, width: u32, height: u32) -> Self {
+        Self {
+            page_num,
+            data: Arc::new(data),
+            width,
+            height,
+        }
+    }
+
+    pub fn from_components(
+        page_num: usize,
+        components: PageComponents,
+        params: &PageEncodeParams,
+        dpi: u32,
+        gamma: Option<f32>,
+    ) -> Result<Self> {
+        let (width, height) = components.dimensions();
+        let dpm = (dpi * 100 / 254) as u32;
+        let rotation = if width >= height { 1 } else { 1 };
+        let data = components.encode(params, (page_num + 1) as u32, dpm, rotation, gamma)?;
+        Ok(Self {
+            page_num,
+            data: Arc::new(data),
+            width,
+            height,
+        })
+    }
+}
 
 /// Configuration for page encoding
 #[derive(Debug, Clone)]
@@ -26,8 +119,20 @@ pub struct PageEncodeParams {
     pub use_iw44: bool,
     /// Whether to encode in color (true) or grayscale (false)
     pub color: bool,
-    /// Target SNR in dB for IW44 encoding
+    /// Target SNR in dB for IW44 encoding (overrides bg_quality if set)
     pub decibels: Option<f32>,
+    /// Maximum slices per chunk (default: 74, like C44)
+    pub slices: Option<usize>,
+    /// Maximum bytes per chunk (default: None)
+    pub bytes: Option<usize>,
+    /// Fraction of blocks used for quality estimation (default: 0.35)
+    pub db_frac: f32,
+    /// Lossless encoding mode (default: false)
+    pub lossless: bool,
+    /// Quantization multiplier for IW44 (default: 1.0, range: 0.5-2.0)
+    /// Lower = more coefficients = better quality but larger files
+    /// Higher = fewer coefficients = smaller files but lower quality
+    pub quant_multiplier: Option<f32>,
 }
 
 impl Default for PageEncodeParams {
@@ -39,6 +144,11 @@ impl Default for PageEncodeParams {
             use_iw44: true, // Default to IW44 for background
             color: true,    // Default to color encoding
             decibels: None,
+            slices: Some(74), // C44 default
+            bytes: None,
+            db_frac: 0.35,
+            lossless: false,
+            quant_multiplier: None, // Use C++ default
         }
     }
 }
@@ -48,26 +158,87 @@ impl Default for PageEncodeParams {
 /// Use `PageComponents::new()` to create an empty page, then add components
 /// like background, foreground, and mask using the `with_*` methods.
 /// The dimensions of the first image added will set the dimensions for the page.
-#[derive(Default)]
 pub struct PageComponents {
     /// Page width in pixels
     width: u32,
     /// Page height in pixels
     height: u32,
     /// Optional background image data (for IW44)
-    pub background: Option<RgbImage>,
+    pub background: Option<Pixmap>,
     /// Optional foreground image data (for JB2)
     pub foreground: Option<BitImage>,
     /// Optional mask data (bitonal)
     pub mask: Option<BitImage>,
+    /// JB2 shape dictionary (bitonal symbol images)
+    /// Used for manual JB2 encoding without connected component analysis
+    pub jb2_shapes: Option<Vec<BitImage>>,
+    /// JB2 blit positions: (left, bottom, shape_index)
+    /// Used for manual JB2 encoding without connected component analysis
+    pub jb2_blits: Option<Vec<(i32, i32, usize)>>,
     /// Optional text/annotations
     pub text: Option<String>,
+    pub layers: Vec<PageLayer>,
+    /// Optional hidden text layer (TXTa/TXTz)
+    pub text_layer: Option<HiddenText>,
+    /// Optional hyperlink/annotation layer (ANTa/ANTz)
+    pub annotations: Option<Annotations>,
+    /// Optional shared JB2 dictionary for cross-page symbol sharing
+    pub shared_dict: Option<std::sync::Arc<crate::encode::jb2::symbol_dict::SharedDict>>,
+}
+
+impl Default for PageComponents {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            background: None,
+            foreground: None,
+            mask: None,
+            text: None,
+            layers: Vec::new(),
+            text_layer: None,
+            annotations: None,
+            shared_dict: None,
+            jb2_shapes: None,
+            jb2_blits: None,
+        }
+    }
 }
 
 impl PageComponents {
     /// Creates a new, empty page.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn new_with_dimensions(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            background: None,
+            foreground: None,
+            mask: None,
+            text: None,
+            layers: Vec::new(),
+            text_layer: None,
+            annotations: None,
+            shared_dict: None,
+            jb2_shapes: None,
+            jb2_blits: None,
+        }
+    }
+
+    /// Sets a shared JB2 dictionary for cross-page symbol sharing.
+    ///
+    /// When encoding multiple pages with shared symbols (e.g., common fonts),
+    /// using a shared dictionary allows referencing previously encoded shapes
+    /// instead of re-encoding them, improving compression.
+    pub fn with_shared_dict(
+        mut self,
+        dict: std::sync::Arc<crate::encode::jb2::symbol_dict::SharedDict>,
+    ) -> Self {
+        self.shared_dict = Some(dict);
+        self
     }
 
     /// Returns the dimensions of the page.
@@ -90,30 +261,169 @@ impl PageComponents {
         Ok(())
     }
 
-    /// Adds a background image to the page.
-    pub fn with_background(mut self, image: RgbImage) -> Result<Self> {
-        self.check_and_set_dimensions(image.dimensions())?;
-        self.background = Some(image);
+    pub fn add_iw44_background(mut self, image: Pixmap, rect: Rect) -> Result<Self> {
+        let new_dims = (rect.x + rect.width, rect.y + rect.height);
+        self.check_and_set_dimensions(new_dims)?;
+        if image.width() != rect.width || image.height() != rect.height {
+            return Err(DjvuError::InvalidOperation(
+                "Background layer dimensions do not match rect".to_string(),
+            ));
+        }
+
+        if rect.x == 0 && rect.y == 0 && rect.width == self.width && rect.height == self.height {
+            self.background = Some(image.clone());
+        } else {
+            let mut canvas = self
+                .background
+                .take()
+                .unwrap_or_else(|| Pixmap::from_pixel(self.width, self.height, Pixel::white()));
+            for y in 0..rect.height {
+                for x in 0..rect.width {
+                    let px = image.get_pixel(x, y);
+                    canvas.put_pixel(rect.x + x, rect.y + y, px);
+                }
+            }
+            self.background = Some(canvas);
+        }
+
+        self.layers.push(PageLayer::IW44Background { image, rect });
         Ok(self)
+    }
+
+    pub fn add_jb2_foreground(mut self, image: BitImage, rect: Rect) -> Result<Self> {
+        let new_dims = (rect.x + rect.width, rect.y + rect.height);
+        self.check_and_set_dimensions(new_dims)?;
+        if image.width as u32 != rect.width || image.height as u32 != rect.height {
+            return Err(DjvuError::InvalidOperation(
+                "Foreground layer dimensions do not match rect".to_string(),
+            ));
+        }
+
+        let mut dest = match self.foreground.take() {
+            Some(d) => d,
+            None => BitImage::new(self.width, self.height).map_err(|e| {
+                DjvuError::InvalidOperation(format!("Failed to allocate foreground bitmap: {e}"))
+            })?,
+        };
+        blit_bit_image(&mut dest, &image, rect.x, rect.y);
+        self.foreground = Some(dest);
+        self.layers.push(PageLayer::JB2Foreground { image, rect });
+        Ok(self)
+    }
+
+    pub fn add_jb2_mask(mut self, image: BitImage, rect: Rect) -> Result<Self> {
+        let new_dims = (rect.x + rect.width, rect.y + rect.height);
+        self.check_and_set_dimensions(new_dims)?;
+        if image.width as u32 != rect.width || image.height as u32 != rect.height {
+            return Err(DjvuError::InvalidOperation(
+                "Mask layer dimensions do not match rect".to_string(),
+            ));
+        }
+
+        let mut dest = match self.mask.take() {
+            Some(d) => d,
+            None => BitImage::new(self.width, self.height)
+                .map_err(|e| DjvuError::InvalidOperation(format!("Failed to allocate mask bitmap: {e}")))?,
+        };
+        blit_bit_image(&mut dest, &image, rect.x, rect.y);
+        self.mask = Some(dest);
+        self.layers.push(PageLayer::JB2Mask { image, rect });
+        Ok(self)
+    }
+
+    /// Adds a background image to the page.
+    pub fn with_background(self, image: Pixmap) -> Result<Self> {
+        let rect = Rect::from_dimensions(image.width(), image.height());
+        self.add_iw44_background(image, rect)
     }
 
     /// Adds a foreground image to the page.
-    pub fn with_foreground(mut self, image: BitImage) -> Result<Self> {
-        self.check_and_set_dimensions((image.width(), image.height()))?;
-        self.foreground = Some(image);
-        Ok(self)
+    pub fn with_foreground(self, image: BitImage) -> Result<Self> {
+        let rect = Rect::from_dimensions(image.width as u32, image.height as u32);
+        self.add_jb2_foreground(image, rect)
     }
 
     /// Adds a mask to the page.
-    pub fn with_mask(mut self, image: BitImage) -> Result<Self> {
-        self.check_and_set_dimensions((image.width(), image.height()))?;
-        self.mask = Some(image);
-        Ok(self)
+    pub fn with_mask(self, image: BitImage) -> Result<Self> {
+        let rect = Rect::from_dimensions(image.width as u32, image.height as u32);
+        self.add_jb2_mask(image, rect)
     }
 
     /// Adds text/annotations to the page.
     pub fn with_text(mut self, text: String) -> Self {
         self.text = Some(text);
+        self
+    }
+
+    /// Adds a hidden text layer for OCR/searchability.
+    pub fn with_text_layer(mut self, text_layer: HiddenText) -> Self {
+        self.text_layer = Some(text_layer);
+        self
+    }
+
+    /// Adds JB2 data manually (shapes and blit positions).
+    /// 
+    /// This allows encoding JB2 without connected component analysis.
+    /// Users provide pre-extracted shapes and their positions on the page.
+    /// 
+    /// # Arguments
+    /// * `shapes` - Vector of bitonal symbol images (the dictionary)
+    /// * `blits` - Vector of (left, bottom, shape_index) tuples indicating where each symbol appears
+    /// 
+    /// # Example
+    /// ```ignore
+    /// let shape1 = BitImage::new(10, 10).unwrap();
+    /// let shape2 = BitImage::new(12, 12).unwrap();
+    /// let shapes = vec![shape1, shape2];
+    /// let blits = vec![
+    ///     (0, 0, 0),    // First blit uses shape1
+    ///     (20, 0, 1),   // Second blit uses shape2
+    ///     (40, 0, 0),   // Third blit reuses shape1
+    /// ];
+    /// let page = PageComponents::new_with_dimensions(100, 100)
+    ///     .with_jb2_manual(shapes, blits);
+    /// ```
+    pub fn with_jb2_manual(mut self, shapes: Vec<BitImage>, blits: Vec<(i32, i32, usize)>) -> Self {
+        self.jb2_shapes = Some(shapes);
+        self.jb2_blits = Some(blits);
+        self
+    }
+
+    /// Adds JB2 data by automatically extracting connected components from a bitonal image.
+    /// 
+    /// Requires the `symboldict` feature to be enabled.
+    /// Uses the `lutz` crate for connected component analysis and symbol matching.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// {
+    ///     let bitimage = create_bitonal_text_image();
+    ///     let page = PageComponents::new_with_dimensions(800, 600)
+    ///         .with_jb2_auto_extract(bitimage)?;
+    /// }
+    /// ```
+    pub fn with_jb2_auto_extract(mut self, image: BitImage) -> Result<Self> {
+        use crate::encode::jb2::{analyze_page, shapes_to_encoder_format};
+        
+        // Run connected component analysis
+        let dpi = 300; // Default DPI
+        let losslevel = 1; // Enable some cleaning
+        let cc_image = analyze_page(&image, dpi, losslevel);
+        
+        // Extract shapes
+        let shapes = cc_image.extract_shapes();
+        
+        // Convert to encoder format
+        let (bitmaps, _parents, blits) = shapes_to_encoder_format(shapes, image.height as i32);
+        
+        self.jb2_shapes = Some(bitmaps);
+        self.jb2_blits = Some(blits);
+        Ok(self)
+    }
+
+    /// Adds hyperlink/annotation data.
+    pub fn with_annotations(mut self, annotations: Annotations) -> Self {
+        self.annotations = Some(annotations);
         self
     }
 
@@ -161,64 +471,196 @@ impl PageComponents {
                 }
             }
             // If no background but JB2 content exists, emit an all-white BG44
-            if !wrote_bg44 && (self.foreground.is_some() || self.mask.is_some()) {
+            if !wrote_bg44 && (self.foreground.is_some() || self.mask.is_some() || self.jb2_shapes.is_some()) {
                 let (w, h) = (self.width, self.height);
-                let white_bg = RgbImage::from_pixel(w, h, image::Rgb([255, 255, 255]));
+                let white_bg = Pixmap::from_pixel(w, h, Pixel::white());
                 self.encode_iw44_background(&white_bg, &mut writer, params)?;
             }
 
-            // --- Djbz + Sjbz: JB2 dictionary and mask/foreground ---
-            // If JB2 content is present (foreground or mask), emit Djbz and then Sjbz
-            if let Some(fg_img) = &self.foreground {
+            // --- Djbz + Sjbz: JB2 encoding ---
+            let mut num_blits = 0;
+            let mut encoded_sjbz: Option<Vec<u8>> = None;
+
+            // JB2 can come from three sources (in priority order):
+            // 1. Manual jb2_shapes/jb2_blits (always available, no feature required)
+            // 2. Auto-extracted from foreground (requires symboldict feature)
+            // 3. Auto-extracted from mask (requires symboldict feature)
+            
+            let _jb2_encoded = if let (Some(shapes), Some(blits)) = (&self.jb2_shapes, &self.jb2_blits) {
+                num_blits = blits.len();
+                // Manual JB2 encoding (no feature required)
                 use crate::encode::jb2::encoder::JB2Encoder;
-                let mut jb2_encoder = JB2Encoder::new(Vec::new());
-                // Build dictionary and connected components
-                let mut dict_builder = crate::encode::jb2::symbol_dict::SymDictBuilder::new(0);
-                let (dictionary, components) = dict_builder.build(fg_img);
-                // --- Djbz ---
-                let dict_raw = jb2_encoder
-                    .encode_dictionary_chunk(&dictionary)
-                    .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
-                let dict_bzz = bzz_compress(&dict_raw, 256)
-                    .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
-                writer.put_chunk("Djbz")?;
-                writer.write_all(&dict_bzz)?;
-                writer.close_chunk()?;
+                let parents: Vec<i32> = vec![-1; shapes.len()];
+
                 // --- Sjbz ---
-                let sjbz_raw = jb2_encoder
-                    .encode_page_chunk(&components)
+                let mut page_encoder = JB2Encoder::new(Vec::new());
+                let sjbz_raw = page_encoder
+                    .encode_page_with_shapes(
+                        self.width,
+                        self.height,
+                        shapes,
+                        &parents,
+                        blits,
+                        0,
+                        None,
+                    )
                     .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
-                let sjbz_bzz = bzz_compress(&sjbz_raw, 256)
-                    .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
+                
+                encoded_sjbz = Some(sjbz_raw);
+                true
+            } else {
+                false
+            };
+            
+            // Auto-extraction fallback (only if manual JB2 wasn't used)
+            if !_jb2_encoded {
+                if let Some(fg_img) = &self.foreground {
+                    // Auto-extract from foreground (requires symboldict feature)
+                    use crate::encode::jb2::{analyze_page, shapes_to_encoder_format, encoder::JB2Encoder};
+                    
+                    let mut page_encoder = JB2Encoder::new(Vec::new());
+                    
+                    // Run connected component analysis
+                    let dpi = 300;
+                    let losslevel = 1;
+                    let cc_image = analyze_page(fg_img, dpi, losslevel);
+                    let shapes = cc_image.extract_shapes();
+                    let (dictionary, parents, blits) = shapes_to_encoder_format(shapes, self.height as i32);
+                    num_blits = blits.len();
+
+                    // --- Sjbz ---
+                    let sjbz_raw = page_encoder
+                        .encode_page_with_shapes(
+                            self.width,
+                            self.height,
+                            &dictionary,
+                            &parents,
+                            &blits,
+                            0,
+                            None,
+                        )
+                        .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
+                    
+                    encoded_sjbz = Some(sjbz_raw);
+                } else if let Some(mask_img) = &self.mask {
+                    // Auto-extract from mask (requires symboldict feature)
+                    use crate::encode::jb2::{analyze_page, shapes_to_encoder_format, encoder::JB2Encoder};
+                    
+                    let mut page_encoder = JB2Encoder::new(Vec::new());
+                    
+                    // Run connected component analysis
+                    let dpi = 300;
+                    let losslevel = 1;
+                    let cc_image = analyze_page(mask_img, dpi, losslevel);
+                    let shapes = cc_image.extract_shapes();
+                    let (dictionary, parents, blits) = shapes_to_encoder_format(shapes, self.height as i32);
+                    num_blits = blits.len();
+
+                    // --- Sjbz ---
+                    let sjbz_raw = page_encoder
+                        .encode_page_with_shapes(
+                            self.width,
+                            self.height,
+                            &dictionary,
+                            &parents,
+                            &blits,
+                            0,
+                            None,
+                        )
+                        .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
+                    
+                    encoded_sjbz = Some(sjbz_raw);
+                }
+            }
+
+            // --- FGbz: Foreground colors for compound images ---
+            // Must be written BEFORE Sjbz to inform viewer of colors?
+            // Spec says no strict order, but standard is BG44 -> FGbz -> Sjbz.
+            
+            let has_jb2 = encoded_sjbz.is_some();
+            if wrote_bg44 && has_jb2 {
+                // Determine if we have blits to color
+                if num_blits > 0 {
+                     // Write FGbz with correspondence (Version 0x80 | 0)
+                    writer.put_chunk("FGbz")?;
+                    
+                    // Version 0 with correspondence bit (0x80)
+                    writer.write_u8(0x80)?;
+                    
+                    // Palette size: 1 (black)
+                    writer.write_u16::<BigEndian>(1)?;
+                    writer.write_all(&[0x00, 0x00, 0x00])?; // Black BGR
+                    
+                    // Correspondence Data (per DjVuPalette.cpp)
+                    // nDataSize: INT24 = number of blits (NOT compressed size)
+                    let n = num_blits as u32;
+                    writer.write_u8(((n >> 16) & 0xFF) as u8)?;
+                    writer.write_u8(((n >> 8) & 0xFF) as u8)?;
+                    writer.write_u8((n & 0xFF) as u8)?;
+                    
+                    // Indices: BZZ encoded stream of INT16 indices (big-endian)
+                    // Since we have only 1 color (index 0), all blits get index 0.
+                    // Each index is written as a 16-bit big-endian integer.
+                    let mut index_bytes = Vec::with_capacity(num_blits * 2);
+                    for _ in 0..num_blits {
+                        index_bytes.push(0u8); // High byte of index 0
+                        index_bytes.push(0u8); // Low byte of index 0
+                    }
+                    let compressed_indices = bzz_compress(&index_bytes, 50)
+                        .map_err(|e| DjvuError::EncodingError(format!("FGbz compression failed: {e}")))?;
+                    writer.write_all(&compressed_indices)?;
+                    
+                    writer.close_chunk()?;
+                } else {
+                    // Fallback for 0 blits: Write simple black FGbz palette
+                    // Format: BYTE version | INT16 nPaletteSize | BYTE3 bgrColor
+                    let fgbz_data: [u8; 6] = [
+                        0x00,             // Version (no correspondence data)
+                        0x00, 0x01,       // nPaletteSize = 1 (big-endian)
+                        0x00, 0x00, 0x00, // BGR color = black
+                    ];
+                    writer.put_chunk("FGbz")?;
+                    writer.write_all(&fgbz_data)?;
+                    writer.close_chunk()?;
+                }
+            }
+            
+            // --- Write Delayed Sjbz ---
+            if let Some(sjbz_data) = encoded_sjbz {
+                // Write raw JB2 stream (already ZP-compressed, no BZZ needed)
                 writer.put_chunk("Sjbz")?;
-                writer.write_all(&sjbz_bzz)?;
-                writer.close_chunk()?;
-            } else if let Some(mask_img) = &self.mask {
-                use crate::encode::jb2::encoder::JB2Encoder;
-                let mut jb2_encoder = JB2Encoder::new(Vec::new());
-                let mut dict_builder = crate::encode::jb2::symbol_dict::SymDictBuilder::new(0);
-                let (dictionary, components) = dict_builder.build(mask_img);
-                // --- Djbz ---
-                let dict_raw = jb2_encoder
-                    .encode_dictionary_chunk(&dictionary)
-                    .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
-                let dict_bzz = bzz_compress(&dict_raw, 256)
-                    .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
-                writer.put_chunk("Djbz")?;
-                writer.write_all(&dict_bzz)?;
-                writer.close_chunk()?;
-                // --- Sjbz ---
-                let sjbz_raw = jb2_encoder
-                    .encode_page_chunk(&components)
-                    .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
-                let sjbz_bzz = bzz_compress(&sjbz_raw, 256)
-                    .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
-                writer.put_chunk("Sjbz")?;
-                writer.write_all(&sjbz_bzz)?;
+                writer.write_all(&sjbz_data)?;
                 writer.close_chunk()?;
             }
 
-            // Write text/annotations if present
+            // --- TXTa/TXTz: Hidden text layer ---
+            if let Some(text_layer) = &self.text_layer {
+                let mut txt_buf = Vec::new();
+                let tl = text_layer;
+                tl.encode(&mut txt_buf)
+                    .map_err(|e| DjvuError::InvalidOperation(format!("Failed to encode hidden text: {e}")))?;
+                // Use BZZ compression for DJVU spec compliance (100KB blocks)
+                let data = bzz_compress(&txt_buf, 100)
+                    .map_err(|e| DjvuError::EncodingError(format!("BZZ compression failed: {e}")))?;
+                writer.put_chunk("TXTz")?;
+                writer.write_all(&data)?;
+                writer.close_chunk()?;
+            }
+
+            // --- ANTa/ANTz: Hyperlink/annotation layer ---
+            if let Some(annotations) = &self.annotations {
+                let mut ann_buf = Vec::new();
+                annotations.encode(&mut ann_buf)
+                    .map_err(|e| DjvuError::InvalidOperation(format!("Failed to encode annotations: {e}")))?;
+                // Use BZZ compression for DJVU spec compliance (100KB blocks)
+                let data = bzz_compress(&ann_buf, 100)
+                    .map_err(|e| DjvuError::EncodingError(format!("BZZ compression failed: {e}")))?;
+                writer.put_chunk("ANTz")?;
+                writer.write_all(&data)?;
+                writer.close_chunk()?;
+            }
+
+            // Write text/annotations if present (legacy plain text)
             if let Some(text) = &self.text {
                 self.write_text_chunk(text, &mut writer)?;
             }
@@ -248,8 +690,8 @@ impl PageComponents {
         writer.write_u16::<BigEndian>(self.width as u16)?;
         writer.write_u16::<BigEndian>(self.height as u16)?;
 
-        // Minor version (1 byte, currently 26 per spec)
-        writer.write_u8(26)?;
+        // Minor version (1 byte, currently 24 per C44 reference)
+        writer.write_u8(24)?;
 
         // Major version (1 byte, currently 0 per spec)
         writer.write_u8(0)?;
@@ -272,12 +714,13 @@ impl PageComponents {
     /// Encodes the background using IW44 (wavelet)
     fn encode_iw44_background(
         &self,
-        img: &RgbImage,
+        img: &Pixmap,
         writer: &mut IffWriter,
         params: &PageEncodeParams,
     ) -> Result<()> {
         let crcb_mode = if params.color {
-            crate::encode::iw44::encoder::CrcbMode::Full
+            // C++ c44.exe uses CRCBnormal by default, not CRCBfull
+            crate::encode::iw44::encoder::CrcbMode::Normal
         } else {
             crate::encode::iw44::encoder::CrcbMode::None
         };
@@ -303,44 +746,32 @@ impl PageComponents {
             );
         }
 
-        // Configure IW44 encoder with proper quality-based parameters
-        // Map quality to decibels if not explicitly set
-        let target_decibels = params.decibels.unwrap_or_else(|| {
-            // Map quality 0-100 to reasonable dB range (30-100 dB)
-            let quality_ratio = params.bg_quality as f32 / 100.0;
-            30.0 + quality_ratio * 70.0 // 30-100 dB range
-        });
-
-        debug!(
-            "Configuring IW44 encoder with quality {} -> {:.1} dB",
-            params.bg_quality, target_decibels
-        );
-
         let iw44_params = IW44EncoderParams {
-            decibels: Some(target_decibels),
+            decibels: params.decibels,
             crcb_mode,
-            ..Default::default()
+            slices: params.slices,
+            bytes: params.bytes,
+            db_frac: params.db_frac,
+            lossless: params.lossless,
+            quant_multiplier: params.quant_multiplier.unwrap_or(1.0),
         };
 
-        // If a mask is present, convert it to GrayImage and pass to IWEncoder for mask-aware encoding
+        // If a mask is present, convert it to Bitmap and pass to IWEncoder for mask-aware encoding
         let mask_gray = if let Some(mask_bitimg) = &self.mask {
-            // Convert BitImage to GrayImage (1=masked, 0=unmasked)
+            // Convert BitImage to Bitmap (1=masked, 0=unmasked)
             let (mw, mh) = (mask_bitimg.width as u32, mask_bitimg.height as u32);
-            let mut mask_buf = vec![0u8; (mw * mh) as usize];
+            let mut mask_pixels = Vec::with_capacity((mw * mh) as usize);
             for y in 0..mh {
                 for x in 0..mw {
-                    mask_buf[(y * mw + x) as usize] =
-                        if mask_bitimg.get_pixel_unchecked(x as usize, y as usize) {
-                            1
-                        } else {
-                            0
-                        };
+                    let pixel_value = if mask_bitimg.get_pixel_unchecked(x as usize, y as usize) {
+                        1
+                    } else {
+                        0
+                    };
+                    mask_pixels.push(GrayPixel::new(pixel_value));
                 }
             }
-            Some(
-                image::GrayImage::from_raw(mw, mh, mask_buf)
-                    .expect("Failed to create GrayImage from mask"),
-            )
+            Some(Bitmap::from_vec(mw, mh, mask_pixels))
         } else {
             None
         };
@@ -349,8 +780,13 @@ impl PageComponents {
             debug!("Using mask-aware IW44 encoding for background");
         }
 
-        let mut encoder = IWEncoder::from_rgb(img, mask_gray.as_ref(), iw44_params)
-            .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
+        let mut encoder = if params.color {
+            IWEncoder::from_rgb(img, mask_gray.as_ref(), iw44_params)
+        } else {
+            let gray = img.to_bitmap();
+            IWEncoder::from_gray(&gray, mask_gray.as_ref(), iw44_params)
+        }
+        .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
 
         // Choose the correct chunk type for IW44 background images:
         // - BG44 for background layer (the main use case for IW44 in DjVu pages)
@@ -362,46 +798,42 @@ impl PageComponents {
             "BG44" // Use BG44 for background images in DjVu pages
         };
 
-        // Encode and write IW44 data in proper chunks according to DjVu spec
-        // Loop until encoder says it's done, like c44.exe does
-
+        // Encode and write IW44 data - use consistent slice limit for all chunks
         let mut chunk_count = 0;
-        let mut more = true;
-
-        while more {
-            let (iw44_stream, encoder_more) = encoder
-                .encode_chunk(usize::MAX) // Encode all remaining slices in one chunk for strict decoder compatibility
+        let slices_per_chunk = params.slices.unwrap_or(74);
+        let mut total_slices_encoded = 0;
+        let total_slices_target = slices_per_chunk;  // For now, match first chunk limit
+        
+        loop {
+            // Check if we've reached total slice target
+            if total_slices_encoded >= total_slices_target {
+                debug!("Reached total slice target {}, stopping", total_slices_target);
+                break;
+            }
+            
+            // Use consistent slice limit for all chunks
+            let (iw44_stream, more) = encoder
+                .encode_chunk(slices_per_chunk)
                 .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
 
-            // An empty stream from the encoder signifies the end of data.
             if iw44_stream.is_empty() {
-                debug!("Encoder returned empty chunk, stopping.");
                 break;
             }
 
             chunk_count += 1;
-            println!(
-                "DEBUG: Writing {} chunk {}, {} bytes total",
-                iw_chunk_id,
-                chunk_count,
-                iw44_stream.len()
-            );
-
-            // Debug: Check what we're actually writing
-            if iw44_stream.len() > 0 {
-                eprintln!(
-                    "[DEBUG] First 16 bytes of chunk data: {:02x?}",
-                    &iw44_stream[..16.min(iw44_stream.len())]
-                );
-            }
-
             writer.put_chunk(iw_chunk_id)?;
             writer.write_all(&iw44_stream)?;
             writer.close_chunk()?;
-
-            more = encoder_more;
+            
+            // Count slices in this chunk (from header)
+            if iw44_stream.len() >= 2 {
+                total_slices_encoded += iw44_stream[1] as usize;
+            }
+            
+            if !more {
+                break;
+            }
         }
-
         debug!("Completed IW44 encoding with {} chunks", chunk_count);
 
         Ok(())
@@ -414,9 +846,9 @@ impl PageComponents {
         writer: &mut IffWriter,
         _quality: u8,
     ) -> Result<()> {
-        // Create JB2 encoder and encode
+        // Create JB2 encoder and encode as single page (non-symbol data)
         let mut jb2_encoder = JB2Encoder::new(Vec::new());
-        let jb2_raw = jb2_encoder.encode_page(img, 0)?;
+        let jb2_raw = jb2_encoder.encode_single_page(img)?;
 
         // BZZ-compress the JB2 data as required by DjVu spec (§3.2.5)
         let sjbz_payload =
@@ -433,9 +865,9 @@ impl PageComponents {
 
     /// Encodes the mask using JB2
     fn _encode_jb2_mask(&self, img: &BitImage, writer: &mut IffWriter) -> Result<()> {
-        // Create JB2 encoder and encode
+        // Create JB2 encoder and encode as single page (non-symbol data)
         let mut jb2_encoder = JB2Encoder::new(Vec::new());
-        let jb2_raw = jb2_encoder.encode_page(img, 0)?;
+        let jb2_raw = jb2_encoder.encode_single_page(img)?;
 
         // BZZ-compress the JB2 data as required by DjVu spec
         let sjbz_payload =
@@ -462,12 +894,12 @@ impl PageComponents {
 mod tests {
     use super::*;
     use crate::encode::symbol_dict::BitImage;
-    use image::{Rgb, RgbImage};
+    use crate::image::image_formats::{Pixel, Pixmap};
 
     #[test]
     fn test_page_encoding_with_builder() {
         // Create a simple white background image
-        let bg_image = RgbImage::from_pixel(100, 200, Rgb([255, 255, 255]));
+        let bg_image = Pixmap::from_pixel(100, 200, Pixel::white());
 
         // Use the builder pattern to create the page
         let page = PageComponents::new()
@@ -498,7 +930,7 @@ mod tests {
 
     #[test]
     fn test_dimension_mismatch() {
-        let bg_image = RgbImage::new(100, 200);
+        let bg_image = Pixmap::new(100, 200);
         let fg_image = BitImage::new(101, 201); // Different dimensions
 
         let result = PageComponents::new()

@@ -196,7 +196,7 @@ impl<'a> IffWriter<'a> {
     /// For composite chunks, the size includes the 4-byte secondary id
     /// to match the DjVu specification and standard IFF format.
     pub fn close_chunk(&mut self) -> Result<()> {
-        let (size_pos, payload_start_pos, is_composite) = self
+        let (size_pos, _payload_start_pos, _is_composite) = self
             .chunk_stack
             .pop()
             .ok_or_else(|| DjvuError::InvalidOperation("close_chunk: no open chunk".into()))?;
@@ -204,15 +204,9 @@ impl<'a> IffWriter<'a> {
         let mut end_pos = self.writer.stream_position()?;
 
         // Calculate the size field value
-        // For composite chunks: include the secondary ID (full payload from after size field)
-        // For simple chunks: exclude nothing (payload from after size field)
-        let size_calculation_start = if is_composite {
-            size_pos + 4 // Start counting from after the size field (includes secondary ID)
-        } else {
-            payload_start_pos // Start counting from after the size field (no secondary ID)
-        };
-
-        let chunk_size_field = end_pos - size_calculation_start;
+        // For composite chunks: include the secondary ID and all data
+        // For simple chunks: include only the data
+        let chunk_size_field = end_pos - (size_pos + 4);
 
         // IFF: pad to even overall size, but byte is **not** counted
         if (chunk_size_field & 1) != 0 {

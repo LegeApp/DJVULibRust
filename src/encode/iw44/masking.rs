@@ -1,15 +1,15 @@
 // src/iw44/masking.rs
 
 use crate::encode::iw44::transform::Encode;
-use ::image::GrayImage;
+use crate::image::image_formats::Bitmap;
 
-/// Convert GrayImage mask to i8 mask buffer
-pub fn image_to_mask8(mask_img: &GrayImage, bw: usize, ih: usize) -> Vec<i8> {
+/// Convert Bitmap mask to i8 mask buffer
+pub fn image_to_mask8(mask_img: &Bitmap, bw: usize, ih: usize) -> Vec<i8> {
     let mut mask8 = vec![0i8; bw * ih];
     for y in 0..ih {
         for x in 0..(mask_img.width() as usize).min(bw) {
             // Non-zero mask pixels indicate masked-out regions
-            let mask_val = mask_img.get_pixel(x as u32, y as u32)[0];
+            let mask_val = mask_img.get_pixel(x as u32, y as u32).y;
             mask8[y * bw + x] = if mask_val > 0 { 1 } else { 0 };
         }
     }
@@ -139,6 +139,7 @@ pub fn forward_mask(
     }
     // 2) scratch buffer for single-level decomposition (now i32)
     let mut scratch = vec![0i32; w * h];
+    let mut scratch_i16 = vec![0i16; w * h];
 
     let mut scale = begin.next_power_of_two();
     while scale < end {
@@ -152,12 +153,12 @@ pub fn forward_mask(
         let levels = ((scale * 2).trailing_zeros() as usize)
             .saturating_sub(1)
             .min(5);
-        // Convert scratch to i16 for the transform
-        let mut scratch_i16: Vec<i16> = scratch.iter().map(|&v| v as i16).collect();
-        Encode::forward::<4>(&mut scratch_i16, w, h, w, levels);
-        // Convert back to i32
-        for (s, &v) in scratch.iter_mut().zip(scratch_i16.iter()) {
-            *s = v as i32;
+        for i in 0..scratch.len() {
+            scratch_i16[i] = scratch[i] as i16;
+        }
+        Encode::forward(&mut scratch_i16, w, h, w, levels);
+        for i in 0..scratch.len() {
+            scratch[i] = scratch_i16[i] as i32;
         }
 
         // zero out masked detail coefficients
@@ -189,12 +190,12 @@ pub fn forward_mask(
         }
 
         // re-decompose to freeze the mask out
-        // Convert scratch to i16 for the transform
-        let mut scratch_i16: Vec<i16> = scratch.iter().map(|&v| v as i16).collect();
-        Encode::forward::<4>(&mut scratch_i16, w, h, w, levels);
-        // Convert back to i32
-        for (s, &v) in scratch.iter_mut().zip(scratch_i16.iter()) {
-            *s = v as i32;
+        for i in 0..scratch.len() {
+            scratch_i16[i] = scratch[i] as i16;
+        }
+        Encode::forward(&mut scratch_i16, w, h, w, levels);
+        for i in 0..scratch.len() {
+            scratch[i] = scratch_i16[i] as i32;
         }
 
         // copy the frozen coefficients back into data (convert i32 to i16)
