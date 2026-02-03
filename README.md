@@ -1,14 +1,14 @@
-# DjVu Encoder
+# DjVuLibRust
 
 [![Crates.io](https://img.shields.io/crates/v/djvu_encoder.svg)](https://crates.io/crates/djvu_encoder)
 [![Documentation](https://docs.rs/djvu_encoder/badge.svg)](https://docs.rs/djvu_encoder)
 [![License](https://img.shields.io/crates/l/djvu_encoder.svg)](https://github.com/yourusername/djvu_encoder/blob/main/LICENSE)
 
-A high-performance Rust library for encoding DjVu documents with a modern builder API.
+Rust library for encoding DjVu documents with a modern builder API. 100% working as of 1/2026.
 
 ## Overview
 
-DjVu Encoder provides a thread-safe, coordinate-based API for creating multi-page DjVu documents from image data. It supports out-of-order page processing, automatic layer masking, and optional parallel encoding for high-throughput workflows.
+DjVuLibRust provides a thread-safe, coordinate-based API for creating multi-page DjVu documents from image data. It supports out-of-order page processing, automatic layer masking, and optional parallel encoding.
 
 ## Key Features
 
