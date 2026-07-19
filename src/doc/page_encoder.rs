@@ -850,11 +850,19 @@ impl PageComponents {
             quant_multiplier: params.quant_multiplier.unwrap_or(1.0),
         };
 
+        // Mask-aware IW44 (masked wavelet) is DISABLED: the forward_mask port
+        // produces oversized, low-fidelity output (validated against ddjvu on
+        // real pages 2026-07). Callers get nearly the same rate benefit by
+        // filling the to-be-masked pixels with the surrounding paper color
+        // (e.g. white) before encoding the background. Re-enable by setting
+        // ENABLE_MASKED_IW44 once forward_mask matches IW44EncodeCodec.cpp.
+        const ENABLE_MASKED_IW44: bool = false;
+
         // If a mask is present, convert it to Bitmap and pass to IWEncoder for mask-aware encoding.
         // When subsampling, the mask must be reduced to the same resolution as the background.
         // A reduced pixel is treated as fully masked (1) only if *every* covered full-res mask
         // pixel is masked — so any reduced pixel with visible background is still encoded.
-        let mask_gray = if let Some(mask_bitimg) = &self.mask {
+        let mask_gray = if let (true, Some(mask_bitimg)) = (ENABLE_MASKED_IW44, &self.mask) {
             let (fw, fh) = (mask_bitimg.width as u32, mask_bitimg.height as u32);
             let (mw, mh) = if factor > 1 {
                 (w, h) // match the reduced background dimensions
@@ -907,15 +915,13 @@ impl PageComponents {
         }
         .map_err(|e| DjvuError::EncodingError(e.to_string()))?;
 
-        // Choose the correct chunk type for IW44 background images:
-        // - BG44 for background layer (the main use case for IW44 in DjVu pages)
-        // - FG44 for foreground layer (has mask)
-        // Note: PM44/BM44 are for standalone IW44 files, not DjVu page backgrounds
-        let iw_chunk_id = if self.mask.is_some() {
-            "FG44"
-        } else {
-            "BG44" // Use BG44 for background images in DjVu pages
-        };
+        // The image passed here is always the page BACKGROUND layer, so the
+        // chunk is always BG44 — including on masked (compound) pages, where
+        // the mask selects the FGbz/FG44 foreground where set and this BG44
+        // layer everywhere else. (FG44 would be a separate continuous-tone
+        // foreground layer, which this function does not encode. PM44/BM44
+        // are for standalone IW44 files, not DjVu page backgrounds.)
+        let iw_chunk_id = "BG44";
 
         // Encode and write IW44 data - use consistent slice limit for all chunks
         let mut chunk_count = 0;

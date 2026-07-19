@@ -60,7 +60,10 @@ impl Encode {
                 // Apply bconv table, then scale (matches C++ preprocessing)
                 // C++: buffer[j] = bconv[pixel[j]]  (line 1685)
                 //      data16[j] = (int)(buffer[j]) << iw_shift  (line 1088)
-                let centered = bconv[px as usize] as i32;
+                // bconv is GBitmap-indexed (0 = white ink level); our Bitmap
+                // stores luminance (255 = white), so invert before the table
+                // or gray pages decode video-inverted.
+                let centered = bconv[255 - px as usize] as i32;
                 let scaled = centered << crate::encode::iw44::constants::IW_SHIFT;
                 data16[dst_idx] = scaled as i16;
             }
@@ -101,8 +104,11 @@ impl Encode {
                 } else {
                     0
                 };
-                // Apply bconv table, then scale (matches C++ preprocessing)
-                let centered = bconv[px as usize] as i32;
+                // Apply bconv table, then scale (matches C++ preprocessing).
+                // bconv is GBitmap-indexed (0 = white ink level); our Bitmap
+                // stores luminance (255 = white), so invert before the table
+                // or gray pages decode video-inverted.
+                let centered = bconv[255 - px as usize] as i32;
                 let scaled = centered << crate::encode::iw44::constants::IW_SHIFT;
                 data16[dst_idx] = scaled as i16;
             }

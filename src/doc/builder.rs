@@ -525,9 +525,19 @@ impl DjvuDocument {
     /// safe to call from a worker thread or rayon iterator. Pair with
     /// [`Self::add_encoded_page`] to insert the result into the document.
     pub fn encode_page(&self, page: Page) -> Result<EncodedPage> {
+        self.encode_page_with_params(page, &self.params)
+    }
+
+    /// Encode a page using page-specific parameters while retaining this
+    /// document's DPI and gamma. Useful for manifest-level layer overrides.
+    pub fn encode_page_with_params(
+        &self,
+        page: Page,
+        params: &PageEncodeParams,
+    ) -> Result<EncodedPage> {
         let page_num = page.page_number();
         let components = page.to_components()?;
-        EncodedPage::from_components(page_num, components, &self.params, self.dpi, self.gamma)
+        EncodedPage::from_components(page_num, components, params, self.dpi, self.gamma)
     }
 
     /// Insert an already-encoded page into the document (thread-safe, out-of-order).

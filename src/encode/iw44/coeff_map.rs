@@ -219,13 +219,18 @@ impl CoeffMap {
 
         transform_fn(&mut data16, map.iw, map.ih, map.bw);
 
-        let levels = ((map.iw.min(map.ih) as f32).log2() as usize).min(5);
-        Encode::forward(&mut data16, map.iw, map.ih, map.bw, levels);
-
+        // Mirrors IW44EncodeCodec.cpp Map::Encode::create: the masked path
+        // REPLACES the plain forward transform -- interpolate_mask fills the
+        // don't-care pixels, then forward_mask performs the mask-aware
+        // wavelet decomposition. Running the plain forward first and the
+        // masked pipeline on top double-transforms the data into mush.
         if let Some(mask_img) = mask {
             let mask8 = masking::image_to_mask8(mask_img, map.bw, map.ih);
             masking::interpolate_mask(&mut data16, map.iw, map.ih, map.bw, &mask8, map.bw);
             masking::forward_mask(&mut data16, map.iw, map.ih, map.bw, 1, 32, &mask8, map.bw);
+        } else {
+            let levels = ((map.iw.min(map.ih) as f32).log2() as usize).min(5);
+            Encode::forward(&mut data16, map.iw, map.ih, map.bw, levels);
         }
 
         let blocks_w = map.bw / 32;

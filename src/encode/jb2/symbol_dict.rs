@@ -6,8 +6,6 @@
 //! - `Comparator`: Symbol matching with spatial search for dictionary building
 //! - Simple shared dictionary support for multi-page encoding
 
-use bitvec::order::Msb0;
-use bitvec::prelude::*;
 use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -50,7 +48,10 @@ pub struct Rect {
 pub struct BitImage {
     pub width: usize,
     pub height: usize,
-    bits: BitVec<u8, Msb0>,
+    // Row-major pixels packed MSB-first. A dedicated byte buffer is enough
+    // for the encoder and avoids pulling in a general-purpose bit-vector
+    // implementation (and its transitive dependencies).
+    bits: Vec<u8>,
     packed_cache: OnceLock<Vec<u32>>,
 }
 
@@ -80,8 +81,7 @@ impl BitImage {
             _ => return Err(BitImageError::TooLarge { width, height }),
         };
 
-        let mut bits = BitVec::with_capacity(total_bits);
-        bits.resize(total_bits, false);
+        let bits = vec![0; total_bits.div_ceil(8)];
         Ok(Self {
             width: width_us,
             height: height_us,
@@ -91,12 +91,14 @@ impl BitImage {
     }
 
     pub fn from_bytes(width: usize, height: usize, bytes: &[u8]) -> Self {
-        let mut bv = BitVec::from_slice(bytes);
-        bv.truncate(width * height);
+        let byte_len = width.saturating_mul(height).div_ceil(8);
+        let mut bits = vec![0; byte_len];
+        let copied = byte_len.min(bytes.len());
+        bits[..copied].copy_from_slice(&bytes[..copied]);
         Self {
             width,
             height,
-            bits: bv,
+            bits,
             packed_cache: OnceLock::new(),
         }
     }
@@ -109,16 +111,21 @@ impl BitImage {
     /// otherwise this function will panic.
     #[inline(always)]
     pub fn get_pixel_unchecked(&self, x: usize, y: usize) -> bool {
-        self.bits[y * self.width + x]
+        let bit = y * self.width + x;
+        self.bits[bit / 8] & (0x80 >> (bit % 8)) != 0
     }
 
     pub fn set_usize(&mut self, x: usize, y: usize, val: bool) {
         if x >= self.width || y >= self.height {
             return;
         }
-        let idx = y * self.width + x;
-        if idx < self.bits.len() {
-            self.bits.set(idx, val);
+        let bit = y * self.width + x;
+        let byte = bit / 8;
+        let mask = 0x80 >> (bit % 8);
+        if val {
+            self.bits[byte] |= mask;
+        } else {
+            self.bits[byte] &= !mask;
         }
         self.packed_cache.take(); // Invalidate cache
     }

@@ -3,13 +3,23 @@
 use crate::encode::iw44::transform::Encode;
 use crate::image::image_formats::Bitmap;
 
-/// Convert Bitmap mask to i8 mask buffer
+/// Convert Bitmap mask to i8 mask buffer.
+///
+/// The image data in the coefficient buffer is stored bottom-up (see
+/// `Encode::from_u8_image_with_stride`, which flips rows to match the C++
+/// GPixmap convention), so the mask must be flipped the same way or the
+/// don't-care regions land on the wrong rows.
 pub fn image_to_mask8(mask_img: &Bitmap, bw: usize, ih: usize) -> Vec<i8> {
     let mut mask8 = vec![0i8; bw * ih];
+    let mh = mask_img.height() as usize;
     for y in 0..ih {
+        let src_y = ih - 1 - y; // match the bottom-up flip applied to image data
+        if src_y >= mh {
+            continue;
+        }
         for x in 0..(mask_img.width() as usize).min(bw) {
             // Non-zero mask pixels indicate masked-out regions
-            let mask_val = mask_img.get_pixel(x as u32, y as u32).y;
+            let mask_val = mask_img.get_pixel(x as u32, src_y as u32).y;
             mask8[y * bw + x] = if mask_val > 0 { 1 } else { 0 };
         }
     }

@@ -801,7 +801,13 @@ impl<W: Write> JB2Encoder<W> {
             return Err(Jb2Error::InvalidState("No start record".to_string()));
         }
 
-        // Calculate top and right (DjVuLibre uses 1-based coordinates internally)
+        // DjVuLibre codes blit locations in 1-BASED coordinates
+        // (JB2Image.cpp code_relative_location: left = jblt->left + 1,
+        // bottom = jblt->bottom + 1). The last_* state initializations
+        // (code_image_size) already assume that domain; without the +1 every
+        // decoded page lands one pixel down-left of its true position.
+        let left = left + 1;
+        let bottom = bottom + 1;
         let top = bottom + rows - 1;
         let right = left + columns - 1;
 
