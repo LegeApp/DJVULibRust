@@ -1,5 +1,7 @@
 # DJVULibRust
 
+> **Archived:** The newest version of this codec is maintained in the [Lege monorepo](https://github.com/LegeApp/Lege/tree/main/lege-codecs/djvulibrust).
+
 [![Crates.io](https://img.shields.io/crates/v/djvu_encoder.svg)](https://crates.io/crates/djvu_encoder)
 [![Documentation](https://docs.rs/djvu_encoder/badge.svg)](https://docs.rs/djvu_encoder)
 [![Repository](https://img.shields.io/badge/github-LegeApp%2FDJVULibRust-blue)](https://github.com/LegeApp/DJVULibRust)
